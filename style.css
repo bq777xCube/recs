@@ -1,0 +1,101 @@
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: 'Helvetica', 'Arial', sans-serif;
+    background-color: #f4f7f6;
+    color: #333;
+    line-height: 1.6;
+    padding: 20px;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    min-height: 100vh;
+}
+
+.container {
+    background-color: white;
+    border-radius: 10px;
+    box-shadow: 0 5px 15px rgba(0, 0, 0, 0.1);
+    padding: 30px;
+    width: 90%;
+    max-width: 600px;
+}
+
+h1 {
+    text-align: center;
+    margin-bottom: 15px;
+    color: #2c3e50;
+}
+
+p {
+    text-align: center;
+    margin-bottom: 20px;
+    color: #7f8c8d;
+}
+
+.controls {
+    display: flex;
+    flex-direction: column;
+    gap: 15px;
+    margin-bottom: 25px;
+}
+
+#movie-select {
+    padding: 12px;
+    border: 1px solid #ddd;
+    border-radius: 5px;
+    font-size: 16px;
+    background-color: #f9f9f9;
+    transition: border-color 0.3s;
+}
+
+#movie-select:focus {
+    border-color: #3498db;
+    outline: none;
+}
+
+#recommend-btn {
+    padding: 12px 20px;
+    background-color: #3498db;
+    color: white;
+    border: none;
+    border-radius: 5px;
+    font-size: 16px;
+    cursor: pointer;
+    transition: background-color 0.3s;
+}
+
+#recommend-btn:hover {
+    background-color: #2980b9;
+}
+
+#result-box {
+    background-color: #f8f9fa;
+    padding: 20px;
+    border-radius: 5px;
+    border-left: 4px solid #3498db;
+}
+
+#result {
+    font-weight: bold;
+    color: #2c3e50;
+    text-align: left;
+    margin: 0;
+}
+
+.loading {
+    color: #7f8c8d;
+    font-style: italic;
+}
+
+.error {
+    color: #e74c3c;
+}
+
+.success {
+    color: #27ae60;
+}

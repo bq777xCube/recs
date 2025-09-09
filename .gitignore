@@ -1,0 +1,6 @@
+# macOS
+.DS_Store
+
+# Node (not used, but common)
+node_modules/
+dist/
