@@ -6,7 +6,7 @@ Your task is to generate the complete code for a "Content-Based Movie Recommende
 
 ### **Project Specification: Content-Based Movie Recommender (Modular)**
 
-#### **1. Overall Goal**
+#### **1 . Overall Goal**
 
 Build a single-page web application that recommends movies. The application will use `data.js` to load and parse movie and rating data from local files (`u.item`, `u.data`). The `script.js` file will then use this parsed data to populate the UI and calculate content-based recommendations using the Jaccard similarity index when a user makes a selection.
 
