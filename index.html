@@ -1,29 +1,77 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Content-Based Movie Recommender</title>
-    <link rel="stylesheet" href="style.css">
+  <meta charset="UTF-8" />
+  <meta
+    name="viewport"
+    content="width=device-width, initial-scale=1.0"
+  />
+  <title>PenguAI — Content-Based Movie Recommender</title>
+  <link rel="stylesheet" href="style.css" />
 </head>
 <body>
-    <div class="container">
-        <h1>Content-Based Movie Recommender</h1>
-        <p>Select a movie you like, and we'll find similar ones for you!</p>
-        
-        <div class="controls">
-            <select id="movie-select">
-                <option value="" disabled selected>Select a movie</option>
-            </select>
-            <button id="recommend-btn" onclick="getRecommendations()">Get Recommendations</button>
+  <!-- Background blobs -->
+  <div class="bg-blur bg1"></div>
+  <div class="bg-blur bg2"></div>
+
+  <header class="nav">
+    <div class="brand">
+      <div class="penguin" aria-hidden="true">
+        <div class="p-body">
+          <div class="p-belly"></div>
+          <div class="p-eye left"></div>
+          <div class="p-eye right"></div>
+          <div class="p-beak"></div>
+          <div class="p-feet"></div>
         </div>
-        
-        <div id="result-box">
-            <p id="result">Please wait, loading data...</p>
-        </div>
+      </div>
+      <span class="brand-name">PenguAI</span>
+    </div>
+    <div class="tag">content-based recommender</div>
+  </header>
+
+  <div class="container">
+    <h1>Content-Based Movie Recommender</h1>
+    <p>Select a movie you like, and our penguins will fetch similar ones 🐧</p>
+
+    <div class="controls">
+      <label class="control">
+        <span class="label">Movie</span>
+        <select id="movie-select">
+          <option value="" disabled selected>Select a movie</option>
+        </select>
+      </label>
+
+      <label class="control">
+        <span class="label">Method</span>
+        <select id="algo-select">
+          <option value="jaccard" selected>Jaccard (genre overlap)</option>
+          <option value="cosine">Cosine (one-hot genres)</option>
+        </select>
+      </label>
+
+      <label class="control">
+        <span class="label">Top-K</span>
+        <input id="k-input" type="number" min="1" max="10" step="1" value="2" />
+      </label>
+
+      <button id="recommend-btn" onclick="getRecommendations()">
+        <span class="btn-emoji">🐧</span>
+        Get Recommendations
+      </button>
     </div>
 
-    <script src="data.js"></script>
-    <script src="script.js"></script>
+    <div id="result-box">
+      <p id="result">Please wait, loading data...</p>
+      <ul id="cards" class="cards"></ul>
+    </div>
+  </div>
+
+  <footer class="footer">
+    <span>Made with ❤️ & a colony of penguins.</span>
+  </footer>
+
+  <script src="data.js"></script>
+  <script src="script.js"></script>
 </body>
 </html>
