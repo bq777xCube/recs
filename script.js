@@ -1,8 +1,8 @@
-// ======= Config focused on speed =======
+// ======= Speed presets (Turbo default) =======
 const TRAINING_PRESETS = {
   turbo: {
-    sampleFraction: 0.30, // use 30% of all ratings
-    maxPerUser: 20,       // cap ratings per user to 20 (prevents heavy users from dominating)
+    sampleFraction: 0.30, // 30% of ratings
+    maxPerUser: 20,       // cap per user
     epochs: 6,
     batchSize: 512,
     latentDim: 8,
@@ -27,32 +27,37 @@ let isTraining = false;
 window.onload = async function () {
   try {
     updateStatus('Initializing backend…');
-    // WebGL tends to be the fastest backend for TFJS in-browser
-    await tf.setBackend('webgl');
+    await tf.setBackend('webgl'); // fast path
     await tf.ready();
 
     updateStatus('Loading MovieLens data…');
     await loadData();
 
-    // Populate dropdowns
     populateUserDropdown();
     populateMovieDropdown();
 
-    // Train initial model in Turbo by default
+    // If the optional toggle exists, retrain when it changes
+    const toggle = document.getElementById('turbo-toggle');
+    if (toggle) {
+      toggle.addEventListener('change', () => trainFromUI());
+    }
+
+    // Kick off initial training
     await trainFromUI();
   } catch (error) {
     console.error('Initialization error:', error);
     updateStatus('Error initializing application: ' + error.message, true);
   }
-
-  // Re-train instantly if user toggles turbo mode
-  const turboToggle = document.getElementById('turbo-toggle');
-  turboToggle.addEventListener('change', () => trainFromUI());
 };
 
+function turboEnabled() {
+  const el = document.getElementById('turbo-toggle');
+  // If toggle not present, default to Turbo mode for speed
+  return el ? !!el.checked : true;
+}
+
 async function trainFromUI() {
-  const turbo = document.getElementById('turbo-toggle').checked;
-  const preset = turbo ? TRAINING_PRESETS.turbo : TRAINING_PRESETS.full;
+  const preset = turboEnabled() ? TRAINING_PRESETS.turbo : TRAINING_PRESETS.full;
   await trainModel(preset);
 }
 
@@ -80,12 +85,6 @@ function populateMovieDropdown() {
 }
 
 // ======= Sampling & Tensor prep =======
-/**
- * Build a sampled subset of ratings for faster training.
- * - Randomly shuffles
- * - Keeps at most `maxPerUser` ratings per user
- * - Takes `sampleFraction` of the remaining examples
- */
 function sampleRatings({ sampleFraction, maxPerUser }) {
   const byUser = new Map();
   for (const r of ratings) {
@@ -93,16 +92,13 @@ function sampleRatings({ sampleFraction, maxPerUser }) {
     byUser.get(r.userId).push(r);
   }
 
-  // Limit per-user to keep dataset balanced & small
   const limited = [];
-  for (const [uid, arr] of byUser.entries()) {
-    // Shuffle per user
+  for (const arr of byUser.values()) {
     shuffleInPlace(arr);
     const take = Math.min(arr.length, maxPerUser);
     for (let i = 0; i < take; i++) limited.push(arr[i]);
   }
 
-  // Global shuffle then sample fraction
   shuffleInPlace(limited);
   const keep = Math.max(1, Math.floor(limited.length * sampleFraction));
   return limited.slice(0, keep);
@@ -148,11 +144,7 @@ function createModel(latentDim = 10) {
   const userVector = tf.layers.flatten().apply(userEmbedding);
   const movieVector = tf.layers.flatten().apply(movieEmbedding);
 
-  // Optional L2 normalization can stabilize training a bit
-  const u = tf.layers.activation({ activation: 'linear' }).apply(userVector);
-  const v = tf.layers.activation({ activation: 'linear' }).apply(movieVector);
-
-  const dotProduct = tf.layers.dot({ axes: 1 }).apply([u, v]);
+  const dotProduct = tf.layers.dot({ axes: 1 }).apply([userVector, movieVector]);
   const prediction = tf.layers.reshape({ targetShape: [1] }).apply(dotProduct);
 
   return tf.model({ inputs: [userInput, movieInput], outputs: prediction });
@@ -179,11 +171,10 @@ async function trainModel({
 
     const { userTensor, movieTensor, ratingTensor } = tensorsFromRatings(subset);
 
-    // (Re)create model & compile
     if (model) {
       model.dispose();
       model = null;
-      await tf.nextFrame(); // yield to free WebGL resources
+      await tf.nextFrame();
     }
     model = createModel(latentDim);
     model.compile({
@@ -191,7 +182,6 @@ async function trainModel({
       loss: 'meanSquaredError'
     });
 
-    // Early stopping
     const earlyStop = tf.callbacks.earlyStopping({
       monitor: 'val_loss',
       patience,
@@ -205,9 +195,7 @@ async function trainModel({
       validationSplit: 0.1,
       shuffle: true,
       callbacks: [
-        {
-          onEpochBegin: (epoch) => { lastEpochStart = performance.now(); }
-        },
+        { onEpochBegin: () => { lastEpochStart = performance.now(); } },
         {
           onEpochEnd: (epoch, logs) => {
             const ms = performance.now() - lastEpochStart;
@@ -254,7 +242,6 @@ async function predictRating() {
     const rating = await prediction.data();
     let predictedRating = rating[0];
 
-    // Keep outputs reasonable
     if (Number.isFinite(predictedRating)) {
       predictedRating = Math.max(1, Math.min(5, predictedRating));
     }

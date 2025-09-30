@@ -32,6 +32,7 @@ main { padding: 28px; }
 
 .controls { display: grid; gap: 18px; margin-bottom: 24px; }
 .row.two { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+.row.one { display: grid; grid-template-columns: 1fr; }
 
 .input-group { display: flex; flex-direction: column; gap: 8px; }
 .input-group.toggle { align-items: flex-start; }
@@ -61,7 +62,7 @@ select:focus { outline: none; border-color: #3498db; }
   font-weight: 600;
   cursor: pointer;
   transition: transform 0.2s ease, box-shadow 0.2s ease;
-  align-self: start;
+  justify-self: start;
 }
 #predict-btn:hover:not(:disabled) {
   transform: translateY(-2px);

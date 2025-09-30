@@ -35,10 +35,6 @@ async function loadData() {
   numUsers = userSet.size;
   maxUserId = userIdsSorted.length ? Math.max(...userIdsSorted) : 0;
 
-  console.log(
-    `Loaded ${numMovies} movies (maxMovieId=${maxMovieId}) and ${ratings.length} ratings from ${numUsers} users (maxUserId=${maxUserId})`
-  );
-
   return { movies, ratings, numUsers, numMovies, maxUserId, maxMovieId, userIdsSorted };
 }
 

@@ -17,34 +17,41 @@
       <div class="controls">
         <div class="row two">
           <div class="input-group">
-            <label for="user-select">Select User</label>
+            <label for="user-select">Select User:</label>
             <select id="user-select">
-              <option value="">Loading users...</option>
+              <option value="">Loading users…</option>
             </select>
           </div>
 
           <div class="input-group">
-            <label for="movie-select">Select Movie</label>
+            <label for="movie-select">Select Movie:</label>
             <select id="movie-select">
-              <option value="">Loading movies...</option>
+              <option value="">Loading movies…</option>
             </select>
           </div>
         </div>
 
+        <!-- Optional Turbo toggle (safe to remove) -->
+        <!-- If you keep it, the script will use it; if not, it will default to Turbo mode -->
+        <!--
         <div class="row two">
           <div class="input-group toggle">
             <input type="checkbox" id="turbo-toggle" checked />
             <label for="turbo-toggle">Turbo mode (train faster)</label>
-            <small>Uses a sampled subset of ratings and early stopping</small>
+            <small>Uses a sampled subset of ratings with early stopping</small>
           </div>
-
           <div class="input-group">
-            <button id="predict-btn" onclick="predictRating()" disabled>Predict Rating</button>
+            <span></span>
           </div>
+        </div>
+        -->
+
+        <div class="row one">
+          <button id="predict-btn" onclick="predictRating()" disabled>Predict Rating</button>
         </div>
       </div>
 
-      <div id="status" class="status">Loading data and training model...</div>
+      <div id="status" class="status">Loading data and training model…</div>
       <div id="result" class="result"></div>
     </main>
   </div>
