@@ -1,12 +1,11 @@
 // ======= Speed knobs (tweak if needed) =======
 const SAMPLE_FRACTION = 0.30;   // train on ~30% of ratings
 const MAX_PER_USER    = 20;     // cap ratings per user to keep it small/balanced
-const EPOCHS          = 6;      // fewer epochs
-const BATCH_SIZE      = 512;    // bigger batch = faster
+const EPOCHS          = 6;      // fewer epochs (keeps it fast)
+const BATCH_SIZE      = 512;    // larger batch = faster per epoch (GPU permitting)
 const LATENT_DIM      = 8;      // smaller embedding
 const LR              = 0.002;  // slightly higher LR for faster convergence
-const VAL_SPLIT       = 0.10;   // keep your 10% val split
-const EARLY_STOP_PATIENCE = 2;  // stop when val plateaus (no restoreBestWeights in TFJS)
+const VAL_SPLIT       = 0.10;   // 10% validation split
 
 // Global variables
 let model = null;
@@ -40,7 +39,6 @@ function populateUserDropdown() {
   const userSelect = document.getElementById('user-select');
   userSelect.innerHTML = '';
 
-  // Use actual user IDs from the dataset (robust if not strictly 1..N)
   for (const uid of userIdsSorted) {
     const option = document.createElement('option');
     option.value = uid;
@@ -104,7 +102,6 @@ function sampleRatings(allRatings, fraction = SAMPLE_FRACTION, maxPerUser = MAX_
     byUser.get(r.userId).push(r);
   }
 
-  // shuffle helper
   const shuffle = (arr) => {
     for (let i = arr.length - 1; i > 0; i--) {
       const j = (Math.random() * (i + 1)) | 0;
@@ -135,16 +132,14 @@ async function trainModel() {
     const subset = sampleRatings(ratings, SAMPLE_FRACTION, MAX_PER_USER);
     updateStatus(`Training on ${subset.length} ratings (fast mode)…`);
 
-    // Create model
+    // Create & compile model
     model = createModel(LATENT_DIM);
-
-    // Compile model
     model.compile({
       optimizer: tf.train.adam(LR),
       loss: 'meanSquaredError',
     });
 
-    // Prepare training data (indices must be int32 for embedding layers)
+    // Tensors (embedding indices must be int32)
     const userIds = subset.map((r) => r.userId);
     const movieIds = subset.map((r) => r.movieId);
     const ratingValues = subset.map((r) => r.rating);
@@ -152,12 +147,6 @@ async function trainModel() {
     const userTensor = tf.tensor2d(userIds, [userIds.length, 1], 'int32');
     const movieTensor = tf.tensor2d(movieIds, [movieIds.length, 1], 'int32');
     const ratingTensor = tf.tensor2d(ratingValues, [ratingValues.length, 1], 'float32');
-
-    const earlyStop = tf.callbacks.earlyStopping({
-      monitor: 'val_loss',
-      patience: EARLY_STOP_PATIENCE
-      // NOTE: restoreBestWeights is NOT implemented in TFJS
-    });
 
     let epochStart = 0;
     await model.fit([userTensor, movieTensor], ratingTensor, {
@@ -172,15 +161,12 @@ async function trainModel() {
             const sec = ((performance.now() - epochStart) / 1000).toFixed(1);
             updateStatus(`Epoch ${epoch + 1}/${EPOCHS} — loss ${logs.loss.toFixed(4)} — val ${logs.val_loss?.toFixed(4) ?? '—'} — ${sec}s`);
           }
-        },
-        earlyStop
+        }
       ],
     });
 
-    // Clean up tensors
     tf.dispose([userTensor, movieTensor, ratingTensor]);
 
-    // Update UI
     updateStatus('Training complete. You can predict now.');
     document.getElementById('predict-btn').disabled = false;
     isTraining = false;
