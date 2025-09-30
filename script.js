@@ -1,19 +1,25 @@
-// ===== script.js (GH Pages optimized: WebGL/WASM + caching + progress bar) =====
+// ===== script.js (CPU-only, fast-as-possible + progress bar + caching) =====
+// Runs *only* on your laptop's CPU in the browser (no WebGL/WASM).
+// - Forces tfjs backend to 'cpu'
+// - Uses lean MF (latent=12), bigger batches, no val split, early stopping
+// - Centers targets + adds user/movie bias + L2
+// - Progress bar (throttled) to keep UI responsive
+// - Caches model in IndexedDB to skip retraining on repeat visits
 
 let model = null;
 let isTraining = false;
 let globalMeanRating = 3.5;
 
-// Reused tiny tensors for fast predict()
+// Reused tiny tensors for quick predict()
 let predUserVar = null;
 let predMovieVar = null;
 
-// URL flags
+// Optional: add ?fast=1 to URL to train on a ~60k sample for quick demo
 const params = new URLSearchParams(location.search);
-const FAST_MODE = params.has('fast');   // ?fast=1 -> subsample to ~60k ratings for quicker train
-const NO_CACHE  = params.has('nocache'); // ?nocache=1 -> ignore cached model
+const FAST_MODE = params.has('fast');     // ?fast=1
+const NO_CACHE  = params.has('nocache');  // ?nocache=1 to ignore cached model
 
-// ---------- UI ----------
+// ---------- UI helpers ----------
 function updateStatus(message, isError = false) {
   const el = document.getElementById('status');
   if (!el) return;
@@ -27,17 +33,29 @@ function updateResult(message, className = '') {
   el.innerHTML = message;
   el.className = `result ${className}`;
 }
+
 function populateUserDropdown() {
   const sel = document.getElementById('user-select');
   sel.innerHTML = '';
-  for (const uid of userIdsSorted) { // robust to gaps
-    const opt = document.createElement('option');
-    opt.value = uid;
-    opt.textContent = `User ${uid}`;
-    sel.appendChild(opt);
+  // Prefer robust list from data.js; fallback to 1..numUsers
+  if (typeof userIdsSorted !== 'undefined' && Array.isArray(userIdsSorted) && userIdsSorted.length) {
+    for (const uid of userIdsSorted) {
+      const opt = document.createElement('option');
+      opt.value = uid;
+      opt.textContent = `User ${uid}`;
+      sel.appendChild(opt);
+    }
+  } else {
+    for (let i = 1; i <= numUsers; i++) {
+      const opt = document.createElement('option');
+      opt.value = i;
+      opt.textContent = `User ${i}`;
+      sel.appendChild(opt);
+    }
   }
   sel.disabled = false;
 }
+
 function populateMovieDropdown() {
   const sel = document.getElementById('movie-select');
   sel.innerHTML = '';
@@ -50,7 +68,7 @@ function populateMovieDropdown() {
   sel.disabled = false;
 }
 
-// ---------- Progress bar (throttled to keep UI cheap) ----------
+// ---------- Progress bar (throttled) ----------
 function ensureProgressBar() {
   let wrap = document.getElementById('train-progress-wrap');
   if (wrap) return wrap;
@@ -92,7 +110,7 @@ function ensureProgressBar() {
 let _lastUiUpdate = 0;
 function setProgress(pct, label) {
   const now = performance.now();
-  if (now - _lastUiUpdate < 120) return; // throttle to ~8 fps
+  if (now - _lastUiUpdate < 120) return; // ~8 fps
   _lastUiUpdate = now;
 
   ensureProgressBar();
@@ -103,43 +121,16 @@ function setProgress(pct, label) {
   if (text) text.textContent = `${p.toFixed(1)}%${label ? ' • ' + label : ''}`;
 }
 
-// ---------- Backend selection (WebGL → WASM) ----------
-function loadScript(src) {
-  return new Promise((resolve, reject) => {
-    const s = document.createElement('script');
-    s.src = src; s.async = true;
-    s.onload = resolve; s.onerror = () => reject(new Error(`Failed to load ${src}`));
-    document.head.appendChild(s);
-  });
-}
+// ---------- Force CPU backend ----------
 async function ensureBackend() {
-  try { await tf.setBackend('webgl'); } catch (_) {}
+  await tf.setBackend('cpu');   // <- force CPU
   await tf.ready();
-
-  if (tf.getBackend() === 'webgl') {
-    // Mixed precision for throughput
-    try { tf.env().set('WEBGL_FORCE_F16_TEXTURES', true); } catch (_) {}
-    try { tf.env().set('WEBGL_PACK', true); } catch (_) {}
-    updateStatus('TensorFlow.js backend: webgl (GPU)');
-    return 'webgl';
-  }
-
-  // WASM fallback (fast on many GH Pages clients)
-  updateStatus('WebGL not available — loading WASM backend…');
-  await loadScript('https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-wasm@latest/dist/tf-backend-wasm.js');
-  if (tf.wasm && tf.wasm.setWasmPaths) {
-    tf.wasm.setWasmPaths('https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-wasm@latest/dist/');
-  }
-  const threads = Math.min(4, (navigator.hardwareConcurrency || 4));
-  try { tf.env().set('WASM_NUM_THREADS', threads); } catch (_) {}
-  await tf.setBackend('wasm');
-  await tf.ready();
-  updateStatus(`TensorFlow.js backend: wasm (${threads} threads)`);
-  return 'wasm';
+  updateStatus('TensorFlow.js backend: cpu');
+  return 'cpu';
 }
 
-// ---------- Model ----------
-function createModel(userDim, movieDim, latentDim = 16) {
+// ---------- Model (MF + biases + L2) ----------
+function createModel(userDim, movieDim, latentDim = 12) { // leaner dims = faster on CPU
   const l2 = tf.regularizers.l2({ l2: 1e-6 });
   const glorot = tf.initializers.glorotUniform({ seed: 1337 });
 
@@ -179,10 +170,11 @@ function createModel(userDim, movieDim, latentDim = 16) {
   return tf.model({ inputs: [userInput, movieInput], outputs: out });
 }
 
-// ---------- Cache helpers (skip retraining on GH Pages) ----------
+// ---------- Caching (IndexedDB) ----------
 function dataSignature() {
-  // changes if dataset size or id ranges change
-  return `v3-u${maxUserId}-m${maxMovieId}-n${ratings.length}`;
+  const uDim = (typeof maxUserId !== 'undefined' && maxUserId) ? maxUserId : numUsers;
+  const mDim = (typeof maxMovieId !== 'undefined' && maxMovieId) ? maxMovieId : numMovies;
+  return `cpu-v1-u${uDim}-m${mDim}-n${ratings.length}`;
 }
 async function tryLoadCachedModel(sig) {
   if (NO_CACHE) return false;
@@ -191,38 +183,33 @@ async function tryLoadCachedModel(sig) {
     const mean = localStorage.getItem(`mf-mean-${sig}`);
     if (mean) globalMeanRating = parseFloat(mean);
     updateStatus('Loaded trained model from cache.');
-    // Pre-alloc predict vars after loading
     predUserVar  = tf.variable(tf.tensor2d([[0]], [1, 1], 'int32'));
     predMovieVar = tf.variable(tf.tensor2d([[0]], [1, 1], 'int32'));
     document.getElementById('predict-btn').disabled = false;
     return true;
-  } catch (_) {
-    return false;
-  }
+  } catch (_) { return false; }
 }
 async function saveCachedModel(sig) {
   try {
     await model.save(`indexeddb://mf-${sig}`);
     localStorage.setItem(`mf-mean-${sig}`, String(globalMeanRating));
-  } catch (e) {
-    // Ignore cache errors
-    console.warn('Cache save failed:', e);
-  }
+  } catch (e) { console.warn('Cache save failed:', e); }
 }
 
-// Optional quick mode: reservoir sample to ~60k ratings
+// Optional quick-mode: reservoir sample ~60k ratings
 function maybeSubsample(arr, target = 60000) {
   if (!FAST_MODE || arr.length <= target) return arr;
-  const res = new Array(Math.min(target, arr.length));
-  for (let i = 0; i < res.length; i++) res[i] = arr[i];
-  for (let i = res.length; i < arr.length; i++) {
+  const k = Math.min(target, arr.length);
+  const res = new Array(k);
+  for (let i = 0; i < k; i++) res[i] = arr[i];
+  for (let i = k; i < arr.length; i++) {
     const j = Math.floor(Math.random() * (i + 1));
-    if (j < res.length) res[j] = arr[i];
+    if (j < k) res[j] = arr[i];
   }
   return res;
 }
 
-// ---------- Training ----------
+// ---------- Training (CPU-optimized) ----------
 function earlyStopping(pat = 1) {
   let best = Infinity, wait = 0;
   return { onEpochEnd: (_, logs) => {
@@ -241,18 +228,17 @@ async function trainModel() {
     ensureProgressBar();
     setProgress(0, 'Preparing…');
 
-    const backend = tf.getBackend();
-    const BATCH  = backend === 'webgl' ? 4096 : backend === 'wasm' ? 1024 : 256;
-    const EPOCHS = backend === 'webgl' ? 6    : backend === 'wasm' ? 8    : 4;
-    const VAL_SPLIT = 0.0; // fastest; rely on early stopping with training loss
+    // Embedding dims (robust to gaps)
+    const userDim = (typeof maxUserId !== 'undefined' && maxUserId) ? maxUserId : numUsers;
+    const movieDim = (typeof maxMovieId !== 'undefined' && maxMovieId) ? maxMovieId : numMovies;
 
-    model = createModel(maxUserId, maxMovieId, 16);
-    model.compile({ optimizer: tf.train.adam(0.003), loss: 'meanSquaredError', metrics: ['mae'] });
+    model = createModel(userDim, movieDim, 12);
+    model.compile({ optimizer: tf.train.adam(0.004), loss: 'meanSquaredError', metrics: ['mae'] });
 
-    // Subsample if FAST mode
+    // Optionally subsample for faster demo
     const trainRatings = maybeSubsample(ratings);
-    const N = trainRatings.length;
 
+    const N = trainRatings.length;
     const uids = new Int32Array(N);
     const mids = new Int32Array(N);
     const y    = new Float32Array(N);
@@ -263,7 +249,7 @@ async function trainModel() {
       y[i] = r.rating;
     }
 
-    // Center targets
+    // Center targets around mean
     let s = 0; for (let i = 0; i < N; i++) s += y[i];
     globalMeanRating = s / N;
     for (let i = 0; i < N; i++) y[i] -= globalMeanRating;
@@ -271,6 +257,12 @@ async function trainModel() {
     const Xuser  = tf.tensor2d(uids, [N, 1], 'int32');
     const Xmovie = tf.tensor2d(mids, [N, 1], 'int32');
     const Y      = tf.tensor2d(y,    [N, 1], 'float32');
+
+    // CPU-aimed batch/epochs
+    const threads = Math.max(2, Math.min(8, (navigator.hardwareConcurrency || 4)));
+    const BATCH  = threads >= 8 ? 1024 : 512; // larger batch helps CPU throughput
+    const EPOCHS = 6;                         // early stopping will usually cut earlier
+    const VAL_SPLIT = 0.0;                    // fastest; monitor training loss
 
     const stepsPerEpoch = Math.ceil(N / BATCH);
     let epochIdx = 0;
@@ -307,8 +299,6 @@ async function trainModel() {
     predMovieVar = tf.variable(tf.tensor2d([[0]], [1, 1], 'int32'));
 
     tf.dispose([Xuser, Xmovie, Y]);
-
-    // Cache for next visits (instant load)
     await saveCachedModel(dataSignature());
 
     updateStatus('Model ready. Select a user & movie, then click Predict.');
@@ -368,18 +358,19 @@ async function predictRating() {
 window.onload = async () => {
   try {
     updateStatus('Initializing TensorFlow.js…');
-    const backend = await ensureBackend(); // webgl → wasm
+    await ensureBackend();                // force CPU
+
     updateStatus('Loading MovieLens data…');
-    await loadData(); // from data.js
+    await loadData();                     // from data.js
     populateUserDropdown();
     populateMovieDropdown();
 
-    // Try cache first (instant start on repeat visits)
+    // Try cached model first (instant after the first successful train)
     const sig = dataSignature();
     const cached = await tryLoadCachedModel(sig);
 
     if (!cached) {
-      updateStatus('Data loaded. Starting training…');
+      updateStatus('Data loaded. Starting training on CPU…');
       await trainModel();
     } else {
       updateStatus('Model loaded from cache. Ready for predictions.');
