@@ -15,40 +15,21 @@
 
     <main>
       <div class="controls">
-        <div class="row two">
-          <div class="input-group">
-            <label for="user-select">Select User:</label>
-            <select id="user-select">
-              <option value="">Loading users…</option>
-            </select>
-          </div>
-
-          <div class="input-group">
-            <label for="movie-select">Select Movie:</label>
-            <select id="movie-select">
-              <option value="">Loading movies…</option>
-            </select>
-          </div>
+        <div class="input-group">
+          <label for="user-select">Select User:</label>
+          <select id="user-select">
+            <option value="">Loading users…</option>
+          </select>
         </div>
 
-        <!-- Optional Turbo toggle (safe to remove) -->
-        <!-- If you keep it, the script will use it; if not, it will default to Turbo mode -->
-        <!--
-        <div class="row two">
-          <div class="input-group toggle">
-            <input type="checkbox" id="turbo-toggle" checked />
-            <label for="turbo-toggle">Turbo mode (train faster)</label>
-            <small>Uses a sampled subset of ratings with early stopping</small>
-          </div>
-          <div class="input-group">
-            <span></span>
-          </div>
+        <div class="input-group">
+          <label for="movie-select">Select Movie:</label>
+          <select id="movie-select">
+            <option value="">Loading movies…</option>
+          </select>
         </div>
-        -->
 
-        <div class="row one">
-          <button id="predict-btn" onclick="predictRating()" disabled>Predict Rating</button>
-        </div>
+        <button id="predict-btn" onclick="predictRating()" disabled>Predict Rating</button>
       </div>
 
       <div id="status" class="status">Loading data and training model…</div>
@@ -56,7 +37,7 @@
     </main>
   </div>
 
-  <!-- TFJS + app code -->
+  <!-- TFJS then our modules (file names MUST match) -->
   <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.21.0/dist/tf.min.js"></script>
   <script src="data.js"></script>
   <script src="script.js"></script>
