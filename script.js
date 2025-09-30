@@ -1,14 +1,10 @@
-// ===== script.js (CPU-only • 1 EPOCH ONLY • dense IDs • caching) =====
-// - Hard-locks to CPU (no WASM/WebGL) to avoid kernel errors
-// - Dense ID mapping (shrinks embeddings => faster per step)
-// - 1 epoch training with higher LR + big batches
-// - Throttled progress bar + IndexedDB caching
+// ===== script.js (CPU-only • 1 epoch • bias pre-initialization to avoid 3.5 clustering) =====
 
 let model = null;
 let isTraining = false;
 let globalMeanRating = 3.5;
 
-// Tiny reusable tensors for predict()
+// Reused tiny tensors for predict()
 let predUserVar = null;
 let predMovieVar = null;
 
@@ -105,7 +101,7 @@ function ensureProgressBar() {
 let _lastUiUpdate = 0;
 function setProgress(pct, label) {
   const now = performance.now();
-  if (now - _lastUiUpdate < 180) return; // ~5-6 fps to keep DOM cheap
+  if (now - _lastUiUpdate < 180) return; // ~5-6 fps
   _lastUiUpdate = now;
   ensureProgressBar();
   const fill = document.getElementById('train-progress-fill');
@@ -133,15 +129,15 @@ function buildDenseIdMaps() {
     : Array.from(new Set(ratings.map(r => r.userId))).sort((a,b)=>a-b);
   userCount = users.length;
   userIdToIdx = new Map();
-  users.forEach((uid, i) => userIdToIdx.set(uid, i + 1)); // 1-based indices
+  users.forEach((uid, i) => userIdToIdx.set(uid, i + 1)); // 1-based
 
   movieCount = movies.length;
   movieIdToIdx = new Map();
-  movies.forEach((m, i) => movieIdToIdx.set(m.id, i + 1)); // 1-based indices
+  movies.forEach((m, i) => movieIdToIdx.set(m.id, i + 1)); // 1-based
 }
 
 // ---------- Model (MF + biases + L2) ----------
-function createModel(uCount, mCount, latentDim = 8) { // latent=8 as requested
+function createModel(uCount, mCount, latentDim = 8) {
   const l2 = tf.regularizers.l2({ l2: 1e-6 });
   const glorot = tf.initializers.glorotUniform({ seed: 1337 });
 
@@ -181,8 +177,8 @@ function createModel(uCount, mCount, latentDim = 8) { // latent=8 as requested
 
 // ---------- Cache ----------
 function dataSignature() {
-  // include shape + 1-epoch marker so cache invalidates if dataset changes
-  return `cpu-dense-e1-u${userCount}-m${movieCount}-n${ratings.length}-k8`;
+  // include shape + 1-epoch marker so cache invalidates when dataset changes
+  return `cpu-dense-e1-biasinit-u${userCount}-m${movieCount}-n${ratings.length}-k8`;
 }
 async function tryLoadCachedModel(sig) {
   if (NO_CACHE) return false;
@@ -221,7 +217,42 @@ function maybeSubsample(arr) {
   return arr;
 }
 
-// ---------- Training (1 EPOCH ONLY) ----------
+// ---------- Bias pre-initialization from data ----------
+function computeBiasInitializers(trainRatings) {
+  // We compute:
+  //   globalMean = mean(r)
+  //   userBias[u] = mean(r_u) - globalMean
+  //   movieBias[i]= mean(r_i) - globalMean
+  // and set embedding weights for userBias/movieBias to these values.
+  const uSum = new Float32Array(userCount + 1);
+  const uCnt = new Uint32Array(userCount + 1);
+  const mSum = new Float32Array(movieCount + 1);
+  const mCnt = new Uint32Array(movieCount + 1);
+
+  let sum = 0;
+  for (const r of trainRatings) {
+    const ui = (userIdToIdx.get(r.userId) || 1);
+    const mi = (movieIdToIdx.get(r.movieId) || 1);
+    const y = r.rating;
+    sum += y;
+    uSum[ui] += y; uCnt[ui] += 1;
+    mSum[mi] += y; mCnt[mi] += 1;
+  }
+  const N = trainRatings.length;
+  const mu = sum / N;
+
+  const uBias = new Float32Array(userCount + 1);
+  const mBias = new Float32Array(movieCount + 1);
+  for (let u = 1; u <= userCount; u++) {
+    uBias[u] = uCnt[u] ? (uSum[u] / uCnt[u]) - mu : 0;
+  }
+  for (let m = 1; m <= movieCount; m++) {
+    mBias[m] = mCnt[m] ? (mSum[m] / mCnt[m]) - mu : 0;
+  }
+  return { mu, uBias, mBias };
+}
+
+// ---------- Training (1 EPOCH ONLY, with bias init) ----------
 async function trainModel() {
   const btn = document.getElementById('predict-btn');
   try {
@@ -231,16 +262,31 @@ async function trainModel() {
     ensureProgressBar();
     setProgress(0, 'Preparing…');
 
-    // Build dense maps and model
+    // Build dense maps
     buildDenseIdMaps();
+
+    // Subsample if requested, then compute bias initializers on THAT set
+    const trainRatings = maybeSubsample(ratings);
+    const { mu, uBias, mBias } = computeBiasInitializers(trainRatings);
+    globalMeanRating = mu;
+
+    // Create model
     model = createModel(userCount, movieCount, 8);
-    // Higher LR to make 1 pass count
+
+    // Load bias initializers into embedding layers BEFORE training
+    const userBiasLayer  = model.getLayer('userBias');
+    const movieBiasLayer = model.getLayer('movieBias');
+    const uBiasTensor = tf.tensor2d(uBias, [userCount + 1, 1], 'float32');
+    const mBiasTensor = tf.tensor2d(mBias, [movieCount + 1, 1], 'float32');
+    userBiasLayer.setWeights([uBiasTensor]);
+    movieBiasLayer.setWeights([mBiasTensor]);
+    uBiasTensor.dispose(); mBiasTensor.dispose();
+
+    // Slightly higher LR so a single pass moves embeddings meaningfully
     model.compile({ optimizer: tf.train.adam(0.008), loss: 'meanSquaredError' });
 
-    // Prepare tensors
-    const trainRatings = maybeSubsample(ratings);
+    // Build training tensors (centered around mu)
     const N = trainRatings.length;
-
     const uids = new Int32Array(N);
     const mids = new Int32Array(N);
     const y    = new Float32Array(N);
@@ -248,26 +294,21 @@ async function trainModel() {
       const r = trainRatings[i];
       uids[i] = (userIdToIdx.get(r.userId) || 1) | 0;
       mids[i] = (movieIdToIdx.get(r.movieId) || 1) | 0;
-      y[i] = r.rating;
+      y[i] = r.rating - mu;
     }
-
-    // Center targets
-    let s = 0; for (let i = 0; i < N; i++) s += y[i];
-    globalMeanRating = s / N;
-    for (let i = 0; i < N; i++) y[i] -= globalMeanRating;
 
     const Xuser  = tf.tensor2d(uids, [N, 1], 'int32');
     const Xmovie = tf.tensor2d(mids, [N, 1], 'int32');
     const Y      = tf.tensor2d(y,    [N, 1], 'float32');
 
-    // CPU big batch to reduce steps
+    // Big batches to reduce steps
     const threads = Math.max(2, Math.min(8, (navigator.hardwareConcurrency || 4)));
     const BATCH  = threads >= 8 ? 2048 : 1536;
-    const EPOCHS = 1; // <<— single epoch
+    const EPOCHS = 1;
     const stepsPerEpoch = Math.ceil(N / BATCH);
 
     let epochIdx = 0;
-    const BATCH_UI_STEP = 4; // update UI every 4 batches for lower DOM overhead
+    const BATCH_UI_STEP = 4; // update UI every 4 batches to keep DOM cheap
     const progCb = {
       onTrainBegin: () => setProgress(0, 'Starting…'),
       onEpochBegin: (e) => { epochIdx = e; },
@@ -278,13 +319,13 @@ async function trainModel() {
       },
       onEpochEnd: (e, logs) => {
         setProgress(100, `Epoch ${e + 1}/${EPOCHS} — loss ${logs.loss.toFixed(4)}`);
-        updateStatus(`Epoch ${e + 1}: loss ${logs.loss.toFixed(4)}`);
+        updateStatus(`Epoch ${e + 1}: loss ${logs.loss.toFixed(4)} (bias-initialized)`);
       },
       onTrainEnd: () => setProgress(100, 'Finalizing…'),
     };
 
     updateStatus(
-      `Training ${N.toLocaleString()} ratings — batch ${BATCH}, 1 epoch${FAST_MODE ? ' (FAST subsample)' : ''}…`
+      `Training ${N.toLocaleString()} ratings — batch ${BATCH}, 1 epoch (bias-initialized)…`
     );
 
     await model.fit([Xuser, Xmovie], Y, {
@@ -383,7 +424,7 @@ window.onload = async () => {
       return;
     }
 
-    updateStatus('Data loaded. Starting 1-epoch training on CPU…');
+    updateStatus('Data loaded. Starting 1-epoch training on CPU (bias-initialized)…');
     await trainModel();
   } catch (err) {
     console.error('Initialization error:', err);
