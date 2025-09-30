@@ -1,222 +1,320 @@
-// --- Fast lookup state for cosine ---
-let genreIndex = null;    // Map genre -> index
-let movieVectors = null;  // Float32Array[] aligned with movies[]
-let movieById = new Map();
+// ============================================================
+//  Matrix Factorization (MF) with biases, trained in-browser.
+//  Rating ~ μ + b_u + b_i + <P_u, Q_i>
+//  - μ: global mean
+//  - b_u: user bias
+//  - b_i: item bias
+//  - P_u, Q_i: user/item embeddings (latent factors)
+//  Optimization: MSE over observed ratings with L2 regularization.
+// ============================================================
 
-// Initialize the application when the window loads
+// --- Mappings & tensors ---
+let userIds = [];              // all unique user IDs from ratings (original IDs)
+let movieIds = [];             // all movie IDs from movies (original IDs)
+let userIdToIdx = new Map();   // original userId -> 0..U-1
+let movieIdToIdx = new Map();  // original movieId -> 0..M-1
+let idxToUserId = [];          // reverse maps (for dropdowns)
+let idxToMovieId = [];
+
+let globalMean = 0;            // μ
+
+// --- TF Variables (learned parameters) ---
+let P = null;  // Users latent matrix: [U, K]
+let Q = null;  // Items latent matrix: [M, K]
+let bu = null; // User bias: [U]
+let bi = null; // Item bias: [M]
+
+// --- UI helpers ---
+const $ = (id) => document.getElementById(id);
+const setStatus = (msg, cls='muted') => { const el=$('status-line'); el.textContent=msg; el.className=cls; };
+const setBar = (pct) => { $('bar').style.width = `${Math.max(0, Math.min(100, pct))}%`; };
+
+// Initialize on load
 window.onload = async function () {
   try {
-    // Display loading message
-    const resultElement = document.getElementById('result');
-    resultElement.textContent = "Loading movie data...";
-    resultElement.className = 'loading';
-
-    // Load data
+    setStatus('Loading data…');
     await loadData();
-
-    // Prepare indexes & vectors for cosine
-    prepareIndexes();
-
-    // Populate dropdown and update status
-    populateMoviesDropdown();
-    resultElement.textContent = "Data loaded. Please select a movie.";
-    resultElement.className = 'success';
-  } catch (error) {
-    console.error('Initialization error:', error);
-    // Error message already set in data.js if needed
+    prepareMappings();
+    populateDropdowns();
+    setStatus(`Loaded ${userIds.length} users, ${movieIds.length} movies, ${ratings.length} ratings. Click “Train Model”.`, 'ok');
+  } catch (e) {
+    console.error(e);
   }
 };
 
-// Build helpers: genre index, vectors and id map
-function prepareIndexes() {
-  movieById.clear();
-  const genres = new Set();
-
-  for (const m of movies) {
-    movieById.set(m.id, m);
-    (m.genres || []).forEach(g => genres.add(String(g).trim()));
+// ------------------------------------------------------------
+// Build mappings (sparse original IDs -> dense indices 0..U-1 / 0..M-1)
+// Also compute global mean rating μ.
+// ------------------------------------------------------------
+function prepareMappings() {
+  const uSet = new Set();
+  const mSet = new Set();
+  for (const r of ratings) {
+    uSet.add(r.userId);
+    mSet.add(r.itemId);
   }
 
-  genreIndex = new Map([...genres].map((g, i) => [g, i]));
+  userIds = [...uSet].sort((a,b)=>a-b);
+  movieIds = movies.map(m => m.id); // keep all parsed movies (even if unrated)
+  // If you prefer only rated movies, replace with [...mSet].sort((a,b)=>a-b);
 
-  const G = genreIndex.size;
-  movieVectors = movies.map(m => vectorizeGenres(m, G));
+  userIdToIdx.clear(); movieIdToIdx.clear();
+  idxToUserId = []; idxToMovieId = [];
+
+  userIds.forEach((uid, i) => { userIdToIdx.set(uid, i); idxToUserId[i]=uid; });
+  movieIds.forEach((mid, i) => { movieIdToIdx.set(mid, i); idxToMovieId[i]=mid; });
+
+  // Global mean over observed ratings
+  if (ratings.length > 0) {
+    const s = ratings.reduce((acc, r) => acc + r.rating, 0);
+    globalMean = s / ratings.length;
+  } else {
+    globalMean = 3.5; // fallback
+  }
 }
 
-// Turn a movie's genres into a one-hot vector
-function vectorizeGenres(movie, G) {
-  const v = new Float32Array(G);
-  if (!movie || !Array.isArray(movie.genres)) return v;
-  for (const g of movie.genres) {
-    const idx = genreIndex.get(String(g).trim());
-    if (idx !== undefined) v[idx] = 1;
+// ------------------------------------------------------------
+// Fill user/movie selects
+// ------------------------------------------------------------
+function populateDropdowns() {
+  const userSel = $('user-select');
+  userSel.innerHTML = '<option value="" disabled selected>Select user</option>';
+  idxToUserId.forEach((uid, idx) => {
+    const opt = document.createElement('option');
+    opt.value = String(uid);
+    opt.textContent = `User ${uid}`;
+    userSel.appendChild(opt);
+  });
+
+  const movieSel = $('movie-select');
+  movieSel.innerHTML = '<option value="" disabled selected>Select movie</option>';
+  // sort movies by title for nicer UX
+  const sorted = [...movies].sort((a,b)=>a.title.localeCompare(b.title));
+  for (const m of sorted) {
+    const opt = document.createElement('option');
+    opt.value = String(m.id);
+    opt.textContent = m.title;
+    movieSel.appendChild(opt);
   }
-  return v;
 }
 
-// Populate the movies dropdown with sorted movie titles
-function populateMoviesDropdown() {
-  const selectElement = document.getElementById('movie-select');
+// ------------------------------------------------------------
+// Build a mini-dataset as dense index arrays for TF (Int32) + ratings (Float32)
+// Optionally shuffle.
+// ------------------------------------------------------------
+function buildDataset() {
+  const uIdx = new Int32Array(ratings.length);
+  const iIdx = new Int32Array(ratings.length);
+  const y    = new Float32Array(ratings.length);
 
-  // Clear existing options except the first placeholder
-  while (selectElement.options.length > 1) {
-    selectElement.remove(1);
+  for (let k = 0; k < ratings.length; k++) {
+    const r = ratings[k];
+    const ui = userIdToIdx.get(r.userId);
+    const ii = movieIdToIdx.get(r.itemId);
+    // Skip ratings for items not in our movie list (rare, but safe-guard)
+    uIdx[k] = ui ?? 0;
+    iIdx[k] = ii ?? 0;
+    y[k]    = r.rating;
   }
 
-  // Sort movies alphabetically by title
-  const sortedMovies = [...movies].sort((a, b) => a.title.localeCompare(b.title));
+  // Shuffle in-place (Fisher–Yates)
+  for (let k = y.length - 1; k > 0; k--) {
+    const j = (Math.random()* (k+1))|0;
+    [uIdx[k], uIdx[j]] = [uIdx[j], uIdx[k]];
+    [iIdx[k], iIdx[j]] = [iIdx[j], iIdx[k]];
+    [y[k],    y[j]]    = [y[j],    y[k]];
+  }
 
-  // Add movies to dropdown
-  sortedMovies.forEach(movie => {
-    const option = document.createElement('option');
-    option.value = movie.id;
-    option.textContent = movie.title;
-    selectElement.appendChild(option);
+  // simple train/val split
+  const valFrac = 0.1;
+  const nVal = Math.max(1, Math.floor(y.length * valFrac));
+  const nTrain = y.length - nVal;
+
+  const ds = {
+    train: {
+      users: tf.tensor1d(uIdx.subarray(0, nTrain), 'int32'),
+      items: tf.tensor1d(iIdx.subarray(0, nTrain), 'int32'),
+      ratings: tf.tensor1d(y.subarray(0, nTrain), 'float32'),
+    },
+    val: {
+      users: tf.tensor1d(uIdx.subarray(nTrain), 'int32'),
+      items: tf.tensor1d(iIdx.subarray(nTrain), 'int32'),
+      ratings: tf.tensor1d(y.subarray(nTrain), 'float32'),
+    }
+  };
+  return ds;
+}
+
+// ------------------------------------------------------------
+// Create learnable variables for MF with biases
+// Shapes:
+//  P: [U, K], Q: [M, K], bu: [U], bi: [M]
+// Small random init helps break symmetry.
+// ------------------------------------------------------------
+function initVariables(U, M, K) {
+  const rand = (shape, scale=0.05) => tf.randomNormal(shape, 0, scale, 'float32');
+  if (P) { P.dispose(); Q.dispose(); bu.dispose(); bi.dispose(); }
+  P  = tf.variable(rand([U, K]));
+  Q  = tf.variable(rand([M, K]));
+  bu = tf.variable(tf.zeros([U]));
+  bi = tf.variable(tf.zeros([M]));
+}
+
+// ------------------------------------------------------------
+// Prediction for batches: y_hat = μ + b_u + b_i + <P_u, Q_i>
+// Using embedding lookup via gather()
+// ------------------------------------------------------------
+function predictBatch(uIdx, iIdx) {
+  return tf.tidy(() => {
+    const Pu = tf.gather(P, uIdx);      // [B, K]
+    const Qi = tf.gather(Q, iIdx);      // [B, K]
+    const bu_b = tf.gather(bu, uIdx);   // [B]
+    const bi_b = tf.gather(bi, iIdx);   // [B]
+    const dot = tf.sum(tf.mul(Pu, Qi), -1); // [B]
+    return dot.add(bu_b).add(bi_b).add(globalMean);
   });
 }
 
-// Main recommendation function
-function getRecommendations() {
-  const resultElement = document.getElementById('result');
-  const cards = document.getElementById('cards');
-  cards.innerHTML = '';
-
+// ------------------------------------------------------------
+// Train loop (Adam)
+// Loss = MSE + λ (||P||^2 + ||Q||^2 + ||bu||^2 + ||bi||^2)
+// ------------------------------------------------------------
+async function trainModel() {
   try {
-    // Step 1: Get user input
-    const selectElement = document.getElementById('movie-select');
-    const algoElement = document.getElementById('algo-select');
-    const kInput = document.getElementById('k-input');
+    const K = Math.max(4, Math.min(128, parseInt($('k-input').value, 10) || 20));
+    const epochs = Math.max(1, Math.min(200, parseInt($('epochs-input').value, 10) || 15));
+    const lr = Math.max(1e-3, Math.min(5e-1, parseFloat($('lr-input').value) || 0.05));
 
-    const selectedMovieId = parseInt(selectElement.value, 10);
-    const method = (algoElement.value || 'jaccard').toLowerCase();
-    const k = Math.max(1, Math.min(10, parseInt(kInput.value, 10) || 2));
-
-    if (isNaN(selectedMovieId)) {
-      resultElement.textContent = "Please select a movie first.";
-      resultElement.className = 'error';
+    if (ratings.length === 0) {
+      setStatus('No ratings found. Check u.data.', 'err');
       return;
     }
 
-    // Step 2: Find the liked movie
-    const likedMovie = movieById.get(selectedMovieId);
-    if (!likedMovie) {
-      resultElement.textContent = "Error: Selected movie not found in database.";
-      resultElement.className = 'error';
-      return;
-    }
+    setStatus(`Preparing dataset…`);
+    const U = userIds.length;
+    const M = movieIds.length;
+    initVariables(U, M, K);
 
-    // Show loading message while processing
-    resultElement.textContent = "Calculating recommendations...";
-    resultElement.className = 'loading';
+    const ds = buildDataset();
+    const optimizer = tf.train.adam(lr);
+    const lambda = 0.0005; // L2 regularization weight
+    const clamp = (t) => t.clipByValue(1, 5); // ratings are 1..5
 
-    // Use setTimeout to allow the UI to update before heavy computation
-    setTimeout(() => {
-      try {
-        // Score candidates by selected method
-        const scoredMovies = scoreCandidates(likedMovie, method);
+    $('predict-btn').disabled = true;
+    setBar(0);
 
-        // Step 5: Sort by score in descending order
-        scoredMovies.sort((a, b) => b.score - a.score);
+    // simple early stopping
+    let bestVal = Infinity;
+    let patience = 5, patienceLeft = patience;
+    let bestSnapshot = null;
 
-        // Step 6: Select top-K recommendations
-        const topRecommendations = scoredMovies.slice(0, k);
+    for (let ep = 1; ep <= epochs; ep++) {
+      // ----- TRAIN STEP -----
+      const trainLoss = optimizer.minimize(() => {
+        const yhat = predictBatch(ds.train.users, ds.train.items);
+        const mse = tf.losses.meanSquaredError(ds.train.ratings, clamp(yhat));
+        // L2 regularization
+        const reg = tf.addN([
+          tf.sum(tf.square(P)),
+          tf.sum(tf.square(Q)),
+          tf.sum(tf.square(bu)),
+          tf.sum(tf.square(bi)),
+        ]).mul(lambda);
+        return mse.add(reg);
+      }, true);
 
-        // Step 7: Display results
-        if (topRecommendations.length > 0) {
-          resultElement.textContent = `Because you liked "${likedMovie.title}", we recommend:`;
-          resultElement.className = 'success';
+      // ----- EVAL STEP -----
+      const yhatVal = predictBatch(ds.val.users, ds.val.items);
+      const valMSE = tf.losses.meanSquaredError(ds.val.ratings, clamp(yhatVal));
+      const [train, v] = await Promise.all([trainLoss.data(), valMSE.data()]);
 
-          for (const rec of topRecommendations) {
-            const li = document.createElement('li');
-            li.className = 'card';
-            li.innerHTML = `
-              <h3>${escapeHtml(rec.title)}</h3>
-              <div class="badges">
-                ${(rec.genres || []).map(g => `<span class="badge">${escapeHtml(g)}</span>`).join('')}
-              </div>
-              <p class="muted" style="margin:.5rem 0 0;">Score (${method}): ${rec.score.toFixed(3)}</p>
-            `;
-            cards.appendChild(li);
-          }
-        } else {
-          resultElement.textContent = `No recommendations found for "${likedMovie.title}".`;
-          resultElement.className = 'error';
+      const trainMSE = train[0];
+      const valMse = v[0];
+      setStatus(`Epoch ${ep}/${epochs} — train MSE: ${trainMSE.toFixed(4)} | val MSE: ${valMse.toFixed(4)}`, 'warn');
+      setBar((ep/epochs)*100);
+
+      // Early stopping on val
+      if (valMse + 1e-6 < bestVal) {
+        bestVal = valMse;
+        patienceLeft = patience;
+        // snapshot variables
+        bestSnapshot?.forEach(t => t.dispose());
+        bestSnapshot = [P.clone(), Q.clone(), bu.clone(), bi.clone()];
+      } else {
+        patienceLeft--;
+        if (patienceLeft <= 0) {
+          setStatus(`Early stopped at epoch ${ep}. Best val MSE: ${bestVal.toFixed(4)}`, 'ok');
+          break;
         }
-      } catch (error) {
-        console.error('Error in recommendation calculation:', error);
-        resultElement.textContent = "An error occurred while calculating recommendations.";
-        resultElement.className = 'error';
       }
-    }, 60);
-  } catch (error) {
-    console.error('Error in getRecommendations:', error);
-    resultElement.textContent = "An unexpected error occurred.";
-    resultElement.className = 'error';
+
+      // small pause to keep UI responsive
+      await tf.nextFrame();
+    }
+
+    // Restore best snapshot if available
+    if (bestSnapshot) {
+      P.assign(bestSnapshot[0]); Q.assign(bestSnapshot[1]);
+      bu.assign(bestSnapshot[2]); bi.assign(bestSnapshot[3]);
+      bestSnapshot.forEach(t => t.dispose());
+    }
+
+    ds.train.users.dispose(); ds.train.items.dispose(); ds.train.ratings.dispose();
+    ds.val.users.dispose(); ds.val.items.dispose(); ds.val.ratings.dispose();
+
+    $('predict-btn').disabled = false;
+    setStatus('Model training completed successfully!', 'ok');
+    $('result').textContent = 'Pick a user and a movie, then click “Predict Rating”.';
+  } catch (err) {
+    console.error(err);
+    setStatus('Training failed: ' + err.message, 'err');
   }
 }
 
-// Compute similarity scores for all candidates by method
-function scoreCandidates(likedMovie, method) {
-  const candidates = movies.filter(m => m.id !== likedMovie.id);
+// ------------------------------------------------------------
+// Predict a single (user, movie) rating using learned variables
+// ------------------------------------------------------------
+function predictRating() {
+  const userId = parseInt($('user-select').value, 10);
+  const movieId = parseInt($('movie-select').value, 10);
+  const res = $('result');
 
-  if (method === 'jaccard') {
-    const likedGenres = new Set((likedMovie.genres || []).map(g => String(g).trim()));
-    return candidates.map(candidate => {
-      const cGenres = new Set((candidate.genres || []).map(g => String(g).trim()));
-      const inter = intersectionSize(likedGenres, cGenres);
-      const uni = unionSize(likedGenres, cGenres);
-      const score = uni > 0 ? inter / uni : 0;
-      return { ...candidate, score };
-    });
+  if (!Number.isFinite(userId) || !Number.isFinite(movieId)) {
+    res.textContent = 'Please pick both user and movie.';
+    return;
+  }
+  if (!P || !Q) {
+    res.textContent = 'Model is not trained yet.';
+    return;
   }
 
-  if (method === 'cosine') {
-    const G = genreIndex ? genreIndex.size : 0;
-    const likedVec = vectorizeGenres(likedMovie, G);
-    return candidates.map(c => {
-      const idx = movies.findIndex(m => m.id === c.id);
-      const cVec = movieVectors[idx] || vectorizeGenres(c, G);
-      const score = cosineSim(likedVec, cVec);
-      return { ...c, score };
-    });
+  const ui = userIdToIdx.get(userId);
+  const mi = movieIdToIdx.get(movieId);
+  if (ui == null || mi == null) {
+    res.textContent = 'Unknown user or movie id.';
+    return;
   }
 
-  // Fallback
-  return scoreCandidates(likedMovie, 'jaccard');
+  // Single-item tensors for gather()
+  const u = tf.tensor1d([ui], 'int32');
+  const i = tf.tensor1d([mi], 'int32');
+  const yhat = predictBatch(u, i).clipByValue(1, 5);
+
+  yhat.data().then(arr => {
+    const pred = arr[0];
+    const movie = movies.find(m => m.id === movieId);
+    res.innerHTML = `Predicted rating for <b>User ${userId}</b> on <b>“${escapeHtml(movie?.title || movieId)}”</b>: <b>${pred.toFixed(2)}/5</b>`;
+  }).finally(() => {
+    u.dispose(); i.dispose(); yhat.dispose();
+  });
 }
 
-// --- Set operations for Jaccard ---
-function intersectionSize(aSet, bSet) {
-  let count = 0;
-  for (const x of aSet) if (bSet.has(x)) count++;
-  return count;
-}
-function unionSize(aSet, bSet) {
-  const seen = new Set(aSet);
-  for (const x of bSet) seen.add(x);
-  return seen.size;
-}
-
-// --- Cosine similarity on Float32Array vectors ---
-function cosineSim(a, b) {
-  let dot = 0, na = 0, nb = 0;
-  const L = Math.min(a.length, b.length);
-  for (let i = 0; i < L; i++) {
-    const ai = a[i], bi = b[i];
-    dot += ai * bi;
-    na += ai * ai;
-    nb += bi * bi;
-  }
-  const denom = Math.sqrt(na) * Math.sqrt(nb);
-  return denom ? (dot / denom) : 0;
-}
-
-// --- Utilities ---
+// ------------------------------------------------------------
+// Utility
+// ------------------------------------------------------------
 function escapeHtml(s) {
   return String(s)
-    .replace(/&/g,'&amp;')
-    .replace(/</g,'&lt;')
-    .replace(/>/g,'&gt;')
-    .replace(/"/g,'&quot;')
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;').replace(/"/g,'&quot;')
     .replace(/'/g,'&#039;');
 }

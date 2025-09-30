@@ -2,15 +2,14 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta
-    name="viewport"
-    content="width=device-width, initial-scale=1.0"
-  />
-  <title>PenguAI — Content-Based Movie Recommender</title>
-  <link rel="stylesheet" href="style.css" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>PenguAI — Matrix Factorization Movie Recommender</title>
+  <link rel="stylesheet" href="style.css"/>
+  <!-- TensorFlow.js (browser) -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.20.0/dist/tf.min.js"></script>
 </head>
 <body>
-  <!-- Background blobs -->
+  <!-- fun bg blobs -->
   <div class="bg-blur bg1"></div>
   <div class="bg-blur bg2"></div>
 
@@ -27,49 +26,70 @@
       </div>
       <span class="brand-name">PenguAI</span>
     </div>
-    <div class="tag">content-based recommender</div>
+    <div class="tag">matrix factorization · tf.js</div>
   </header>
 
-  <div class="container">
-    <h1>Content-Based Movie Recommender</h1>
-    <p>Select a movie you like, and our penguins will fetch similar ones 🐧</p>
+  <main class="container">
+    <section class="hero">
+      <h1>Matrix Factorization Movie Recommender</h1>
+      <p class="sub">Train a collaborative model in your browser and predict ratings.</p>
+    </section>
 
-    <div class="controls">
-      <label class="control">
-        <span class="label">Movie</span>
-        <select id="movie-select">
-          <option value="" disabled selected>Select a movie</option>
-        </select>
-      </label>
+    <section class="panel">
+      <div class="grid">
+        <label class="control">
+          <span class="label">Select User</span>
+          <select id="user-select">
+            <option value="" disabled selected>Loading…</option>
+          </select>
+        </label>
 
-      <label class="control">
-        <span class="label">Method</span>
-        <select id="algo-select">
-          <option value="jaccard" selected>Jaccard (genre overlap)</option>
-          <option value="cosine">Cosine (one-hot genres)</option>
-        </select>
-      </label>
+        <label class="control">
+          <span class="label">Select Movie</span>
+          <select id="movie-select">
+            <option value="" disabled selected>Loading…</option>
+          </select>
+        </label>
 
-      <label class="control">
-        <span class="label">Top-K</span>
-        <input id="k-input" type="number" min="1" max="10" step="1" value="2" />
-      </label>
+        <label class="control">
+          <span class="label">Latent Dim (K)</span>
+          <input id="k-input" type="number" min="4" max="128" value="20"/>
+        </label>
 
-      <button id="recommend-btn" onclick="getRecommendations()">
-        <span class="btn-emoji">🐧</span>
-        Get Recommendations
-      </button>
-    </div>
+        <label class="control">
+          <span class="label">Epochs</span>
+          <input id="epochs-input" type="number" min="1" max="200" value="15"/>
+        </label>
 
-    <div id="result-box">
-      <p id="result">Please wait, loading data...</p>
-      <ul id="cards" class="cards"></ul>
-    </div>
-  </div>
+        <label class="control">
+          <span class="label">Learning Rate</span>
+          <input id="lr-input" type="number" step="0.001" min="0.001" max="0.5" value="0.05"/>
+        </label>
 
-  <footer class="footer">
-    <span>Made with ❤️ & a colony of penguins.</span>
-  </footer>
+        <div class="buttons">
+          <button id="train-btn" class="btn" onclick="trainModel()">
+            🐧 Train Model
+          </button>
+          <button id="predict-btn" class="btn ghost" onclick="predictRating()" disabled>
+            Predict Rating
+          </button>
+        </div>
+      </div>
+
+      <div id="status" class="status">
+        <div id="status-line" class="muted">Loading data…</div>
+        <div id="meter" class="meter"><span id="bar"></span></div>
+      </div>
+
+      <div id="result-box" class="result-box">
+        <p id="result" class="muted">Model not trained yet.</p>
+      </div>
+    </section>
+
+    <footer class="footer">
+      <span>Made with ❤️ & a colony of penguins.</span>
+    </footer>
+  </main>
 
   <script src="data.js"></script>
   <script src="script.js"></script>
