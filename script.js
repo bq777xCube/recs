@@ -1,3 +1,13 @@
+// ======= Speed knobs (tweak if needed) =======
+const SAMPLE_FRACTION = 0.30;   // train on ~30% of ratings
+const MAX_PER_USER    = 20;     // cap ratings per user to keep it small/balanced
+const EPOCHS          = 6;      // fewer epochs
+const BATCH_SIZE      = 512;    // bigger batch = faster
+const LATENT_DIM      = 8;      // smaller embedding
+const LR              = 0.002;  // slightly higher LR for faster convergence
+const VAL_SPLIT       = 0.10;   // keep your 10% val split
+const EARLY_STOP_PATIENCE = 2;  // stop when val plateaus (no restoreBestWeights in TFJS)
+
 // Global variables
 let model = null;
 let isTraining = false;
@@ -5,9 +15,12 @@ let isTraining = false;
 // Initialize application when window loads
 window.onload = async function () {
   try {
-    updateStatus('Loading MovieLens data...');
+    updateStatus('Initializing TensorFlow.js backend…');
+    // Fastest in-browser path if available
+    await tf.setBackend('webgl');
+    await tf.ready();
 
-    // Load data first
+    updateStatus('Loading MovieLens data...');
     await loadData();
 
     // Populate dropdowns
@@ -16,8 +29,6 @@ window.onload = async function () {
 
     // Update status and start training
     updateStatus('Data loaded. Training model...');
-
-    // Train the model
     await trainModel();
   } catch (error) {
     console.error('Initialization error:', error);
@@ -42,7 +53,6 @@ function populateMovieDropdown() {
   const movieSelect = document.getElementById('movie-select');
   movieSelect.innerHTML = '';
 
-  // Add movies
   movies.forEach((movie) => {
     const option = document.createElement('option');
     option.value = movie.id;
@@ -55,16 +65,15 @@ function populateMovieDropdown() {
  * Create a simple MF model: <u, v> dot product.
  * Embedding dimensions sized by max ID + 1; indices must be int32.
  */
-function createModel(latentDim = 10) {
-  // Inputs (shape [1]); embedding will receive int32 tensors at runtime
+function createModel(latentDim = LATENT_DIM) {
   const userInput = tf.input({ shape: [1], name: 'userInput' });
   const movieInput = tf.input({ shape: [1], name: 'movieInput' });
 
-  // Embeddings
   const userEmbedding = tf.layers
     .embedding({
       inputDim: maxUserId + 1,
       outputDim: latentDim,
+      embeddingsInitializer: 'heNormal',
       name: 'userEmbedding',
     })
     .apply(userInput);
@@ -73,27 +82,48 @@ function createModel(latentDim = 10) {
     .embedding({
       inputDim: maxMovieId + 1,
       outputDim: latentDim,
+      embeddingsInitializer: 'heNormal',
       name: 'movieEmbedding',
     })
     .apply(movieInput);
 
-  // Flatten embeddings to latent vectors
   const userVector = tf.layers.flatten().apply(userEmbedding);
   const movieVector = tf.layers.flatten().apply(movieEmbedding);
 
-  // Dot product -> predicted rating
   const dotProduct = tf.layers.dot({ axes: 1 }).apply([userVector, movieVector]);
-
-  // Reshape to [1] output
   const prediction = tf.layers.reshape({ targetShape: [1] }).apply(dotProduct);
 
-  // Create model
-  const model = tf.model({
-    inputs: [userInput, movieInput],
-    outputs: prediction,
-  });
+  return tf.model({ inputs: [userInput, movieInput], outputs: prediction });
+}
 
-  return model;
+/** Fast sampling: random subset + per-user cap to shrink training set */
+function sampleRatings(allRatings, fraction = SAMPLE_FRACTION, maxPerUser = MAX_PER_USER) {
+  const byUser = new Map();
+  for (const r of allRatings) {
+    if (!byUser.has(r.userId)) byUser.set(r.userId, []);
+    byUser.get(r.userId).push(r);
+  }
+
+  // shuffle helper
+  const shuffle = (arr) => {
+    for (let i = arr.length - 1; i > 0; i--) {
+      const j = (Math.random() * (i + 1)) | 0;
+      [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+  };
+
+  // limit examples per user
+  const limited = [];
+  for (const arr of byUser.values()) {
+    shuffle(arr);
+    const take = Math.min(arr.length, maxPerUser);
+    for (let i = 0; i < take; i++) limited.push(arr[i]);
+  }
+
+  // global shuffle + fraction
+  shuffle(limited);
+  const keep = Math.max(1, Math.floor(limited.length * fraction));
+  return limited.slice(0, keep);
 }
 
 async function trainModel() {
@@ -101,42 +131,57 @@ async function trainModel() {
     isTraining = true;
     document.getElementById('predict-btn').disabled = true;
 
+    // ===== Speed: sample and shrink =====
+    const subset = sampleRatings(ratings, SAMPLE_FRACTION, MAX_PER_USER);
+    updateStatus(`Training on ${subset.length} ratings (fast mode)…`);
+
     // Create model
-    model = createModel(10);
+    model = createModel(LATENT_DIM);
 
     // Compile model
     model.compile({
-      optimizer: tf.train.adam(0.001),
+      optimizer: tf.train.adam(LR),
       loss: 'meanSquaredError',
     });
 
     // Prepare training data (indices must be int32 for embedding layers)
-    const userIds = ratings.map((r) => r.userId);
-    const movieIds = ratings.map((r) => r.movieId);
-    const ratingValues = ratings.map((r) => r.rating);
+    const userIds = subset.map((r) => r.userId);
+    const movieIds = subset.map((r) => r.movieId);
+    const ratingValues = subset.map((r) => r.rating);
 
     const userTensor = tf.tensor2d(userIds, [userIds.length, 1], 'int32');
     const movieTensor = tf.tensor2d(movieIds, [movieIds.length, 1], 'int32');
     const ratingTensor = tf.tensor2d(ratingValues, [ratingValues.length, 1], 'float32');
 
-    updateStatus('Training model... (This may take a moment)');
+    const earlyStop = tf.callbacks.earlyStopping({
+      monitor: 'val_loss',
+      patience: EARLY_STOP_PATIENCE
+      // NOTE: restoreBestWeights is NOT implemented in TFJS
+    });
 
+    let epochStart = 0;
     await model.fit([userTensor, movieTensor], ratingTensor, {
-      epochs: 10,
-      batchSize: 64,
-      validationSplit: 0.1,
-      callbacks: {
-        onEpochEnd: (epoch, logs) => {
-          updateStatus(`Training epoch ${epoch + 1}/10 - loss: ${logs.loss.toFixed(4)}`);
+      epochs: EPOCHS,
+      batchSize: BATCH_SIZE,
+      validationSplit: VAL_SPLIT,
+      shuffle: true,
+      callbacks: [
+        { onEpochBegin: () => { epochStart = performance.now(); } },
+        {
+          onEpochEnd: (epoch, logs) => {
+            const sec = ((performance.now() - epochStart) / 1000).toFixed(1);
+            updateStatus(`Epoch ${epoch + 1}/${EPOCHS} — loss ${logs.loss.toFixed(4)} — val ${logs.val_loss?.toFixed(4) ?? '—'} — ${sec}s`);
+          }
         },
-      },
+        earlyStop
+      ],
     });
 
     // Clean up tensors
     tf.dispose([userTensor, movieTensor, ratingTensor]);
 
     // Update UI
-    updateStatus('Model training completed successfully!');
+    updateStatus('Training complete. You can predict now.');
     document.getElementById('predict-btn').disabled = false;
     isTraining = false;
   } catch (error) {
@@ -161,24 +206,20 @@ async function predictRating() {
   }
 
   try {
-    // Create input tensors as int32 indices
     const userTensor = tf.tensor2d([[userId]], [1, 1], 'int32');
     const movieTensor = tf.tensor2d([[movieId]], [1, 1], 'int32');
 
-    // Predict
     const prediction = model.predict([userTensor, movieTensor]);
     const rating = await prediction.data();
     let predictedRating = rating[0];
 
-    // Optional: clip to 1..5 to keep outputs reasonable
+    // Clip to 1..5 to keep outputs reasonable
     if (Number.isFinite(predictedRating)) {
       predictedRating = Math.max(1, Math.min(5, predictedRating));
     }
 
-    // Clean up
     tf.dispose([userTensor, movieTensor, prediction]);
 
-    // Display result
     const movie = movies.find((m) => m.id === movieId);
     const movieTitle = movie ? (movie.year ? `${movie.title} (${movie.year})` : movie.title) : `Movie ${movieId}`;
 
