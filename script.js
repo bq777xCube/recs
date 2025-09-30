@@ -1,10 +1,11 @@
-// ===== script.js (GH Pages optimized) =====
+// ===== script.js (GH Pages + Progress Bar) =====
 // Fast & precise Matrix Factorization in TF.js
-// - WebGL backend (with fallback) and tf.ready() wait
+// - WebGL backend (with fallback) and tf.ready()
 // - User/Movie embeddings + per-entity biases
 // - Target centering by global mean
 // - L2 regularization + early stopping
 // - Large batch on GPU, smaller on CPU
+// - Training progress bar (overall % across epochs & batches)
 
 let model = null;
 let isTraining = false;
@@ -50,14 +51,68 @@ function populateMovieDropdown() {
   sel.disabled = false;
 }
 
+// ---------- Lightweight progress bar (auto-injected) ----------
+function ensureProgressBar() {
+  let wrap = document.getElementById('train-progress-wrap');
+  if (wrap) return wrap;
+
+  const status = document.getElementById('status');
+  if (!status) return null;
+
+  wrap = document.createElement('div');
+  wrap.id = 'train-progress-wrap';
+  wrap.style.margin = '12px 0 6px';
+
+  const bar = document.createElement('div');
+  bar.id = 'train-progress';
+  bar.style.width = '100%';
+  bar.style.height = '10px';
+  bar.style.background = '#0f1621';
+  bar.style.border = '1px solid #1f2937';
+  bar.style.borderRadius = '8px';
+  bar.style.overflow = 'hidden';
+
+  const fill = document.createElement('div');
+  fill.id = 'train-progress-fill';
+  fill.style.height = '100%';
+  fill.style.width = '0%';
+  fill.style.background = 'linear-gradient(90deg, #60a5fa, #3b82f6)';
+  fill.style.transition = 'width 120ms linear';
+
+  const text = document.createElement('div');
+  text.id = 'train-progress-text';
+  text.style.fontSize = '12px';
+  text.style.color = '#94a3b8';
+  text.style.marginTop = '6px';
+  text.textContent = '0%';
+
+  bar.appendChild(fill);
+  wrap.appendChild(bar);
+  wrap.appendChild(text);
+
+  // Insert right after status line
+  status.parentElement.insertBefore(wrap, status.nextSibling);
+  return wrap;
+}
+
+function setProgress(pct, label) {
+  const wrap = ensureProgressBar();
+  if (!wrap) return;
+  const p = Math.max(0, Math.min(100, pct));
+  const fill = document.getElementById('train-progress-fill');
+  const text = document.getElementById('train-progress-text');
+  if (fill) fill.style.width = `${p}%`;
+  if (text) text.textContent = `${p.toFixed(1)}%${label ? ' • ' + label : ''}`;
+}
+
+function hideProgressBar() {
+  const wrap = document.getElementById('train-progress-wrap');
+  if (wrap) wrap.style.display = 'none';
+}
+
 // ---------- Backend selection (GH Pages) ----------
 async function ensureBackend() {
-  try {
-    // Prefer WebGL on GitHub Pages for speed
-    await tf.setBackend('webgl');
-  } catch (_) {
-    // Ignore — TF.js will fallback to CPU
-  }
+  try { await tf.setBackend('webgl'); } catch (_) {}
   await tf.ready();
   updateStatus(`TensorFlow.js backend: ${tf.getBackend()}`);
 }
@@ -139,12 +194,15 @@ async function trainModel() {
     isTraining = true;
     if (btn) btn.disabled = true;
 
+    ensureProgressBar();
+    setProgress(0, 'Preparing…');
+
     updateStatus('Building model…');
     model = createModel(numUsers, numMovies, 24);
 
     updateStatus('Compiling model…');
     model.compile({
-      optimizer: tf.train.adam(0.002),     // slightly higher LR for faster convergence
+      optimizer: tf.train.adam(0.002),
       loss: 'meanSquaredError',
       metrics: ['mae']
     });
@@ -173,31 +231,45 @@ async function trainModel() {
     const Xmovie = tf.tensor2d(movieIds, [N, 1], 'int32');
     const Y = tf.tensor2d(y, [N, 1], 'float32');
 
-    // Larger batch on GPU, smaller on CPU
+    // Batch & epochs
     const isGPU = tf.getBackend() === 'webgl';
     const batchSize = isGPU ? 1024 : 256;
+    const maxEpochs = 12;
+    const valSplit = 0.1;
+    const trainSize = Math.floor(N * (1 - valSplit));
+    const stepsPerEpoch = Math.ceil(trainSize / batchSize);
 
-    updateStatus(`Training (${N.toLocaleString()} ratings) — batch ${batchSize}, up to 12 epochs…`);
+    // Progress callbacks
+    let currentEpoch = 0;
+    const progCb = {
+      onTrainBegin: () => setProgress(0, 'Starting…'),
+      onEpochBegin: (epoch) => { currentEpoch = epoch; },
+      onBatchEnd: (batch) => {
+        const overall = ((currentEpoch + (batch + 1) / stepsPerEpoch) / maxEpochs) * 100;
+        setProgress(overall, `Epoch ${currentEpoch + 1}/${maxEpochs}`);
+      },
+      onEpochEnd: (epoch, logs) => {
+        const pct = ((epoch + 1) / maxEpochs) * 100;
+        setProgress(pct, `Epoch ${epoch + 1}/${maxEpochs} — val_loss ${logs.val_loss?.toFixed(4)}`);
+        updateStatus(
+          `Epoch ${epoch + 1} — loss: ${logs.loss.toFixed(4)} • val_loss: ${logs.val_loss?.toFixed(4)} • mae: ${logs.mae?.toFixed(4)}`
+        );
+      },
+      onTrainEnd: () => setProgress(100, 'Finalizing…'),
+    };
 
+    updateStatus(`Training (${N.toLocaleString()} ratings) — batch ${batchSize}, up to ${maxEpochs} epochs…`);
     await model.fit([Xuser, Xmovie], Y, {
-      epochs: 12,
+      epochs: maxEpochs,
       batchSize,
       shuffle: true,
-      validationSplit: 0.1,
-      callbacks: [
-        {
-          onEpochEnd: (epoch, logs) => {
-            updateStatus(
-              `Epoch ${epoch + 1} — loss: ${logs.loss.toFixed(4)} • val_loss: ${logs.val_loss?.toFixed(4)} • mae: ${logs.mae?.toFixed(4)}`
-            );
-          }
-        },
-        earlyStopping(2)
-      ]
+      validationSplit: valSplit,
+      callbacks: [progCb, earlyStopping(2)]
     });
 
     tf.dispose([Xuser, Xmovie, Y]);
 
+    setProgress(100, 'Done');
     updateStatus('Model ready. Select a user & movie, then click Predict.');
     if (btn) btn.disabled = false;
     isTraining = false;
