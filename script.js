@@ -1,23 +1,20 @@
-// ===== script.js (GH Pages + Progress Bar) =====
-// Fast & precise Matrix Factorization in TF.js
-// - WebGL backend (with fallback) and tf.ready()
-// - User/Movie embeddings + per-entity biases
-// - Target centering by global mean
-// - L2 regularization + early stopping
-// - Large batch on GPU, smaller on CPU
-// - Training progress bar (overall % across epochs & batches)
+// ===== script.js (FAST + robust IDs + progress bar) =====
 
 let model = null;
 let isTraining = false;
-let globalMeanRating = 3.5; // set from data during training
+let globalMeanRating = 3.5;
+
+// Reusable tensors to avoid allocs on every predict()
+let predUserVar = null;
+let predMovieVar = null;
 
 // ---------- UI helpers ----------
 function updateStatus(message, isError = false) {
   const el = document.getElementById('status');
   if (!el) return;
   el.textContent = message;
-  el.style.borderLeftColor = isError ? '#ef4444' : '#60a5fa';
-  el.style.background = isError ? 'rgba(239,68,68,0.08)' : 'rgba(96,165,250,0.08)';
+  el.style.borderLeftColor = isError ? '#e74c3c' : '#3498db';
+  el.style.background = isError ? '#fdedec' : '#f8f9fa';
 }
 
 function updateResult(message, className = '') {
@@ -30,10 +27,11 @@ function updateResult(message, className = '') {
 function populateUserDropdown() {
   const sel = document.getElementById('user-select');
   sel.innerHTML = '';
-  for (let i = 1; i <= numUsers; i++) {
+  // Use actual IDs (works even if not contiguous)
+  for (const uid of userIdsSorted) {
     const opt = document.createElement('option');
-    opt.value = i;
-    opt.textContent = `User ${i}`;
+    opt.value = uid;
+    opt.textContent = `User ${uid}`;
     sel.appendChild(opt);
   }
   sel.disabled = false;
@@ -51,7 +49,7 @@ function populateMovieDropdown() {
   sel.disabled = false;
 }
 
-// ---------- Lightweight progress bar (auto-injected) ----------
+// ---------- Progress bar (injected) ----------
 function ensureProgressBar() {
   let wrap = document.getElementById('train-progress-wrap');
   if (wrap) return wrap;
@@ -67,8 +65,8 @@ function ensureProgressBar() {
   bar.id = 'train-progress';
   bar.style.width = '100%';
   bar.style.height = '10px';
-  bar.style.background = '#0f1621';
-  bar.style.border = '1px solid #1f2937';
+  bar.style.background = '#eef3f7';
+  bar.style.border = '1px solid #dde5ee';
   bar.style.borderRadius = '8px';
   bar.style.overflow = 'hidden';
 
@@ -82,7 +80,7 @@ function ensureProgressBar() {
   const text = document.createElement('div');
   text.id = 'train-progress-text';
   text.style.fontSize = '12px';
-  text.style.color = '#94a3b8';
+  text.style.color = '#55657a';
   text.style.marginTop = '6px';
   text.textContent = '0%';
 
@@ -90,11 +88,9 @@ function ensureProgressBar() {
   wrap.appendChild(bar);
   wrap.appendChild(text);
 
-  // Insert right after status line
   status.parentElement.insertBefore(wrap, status.nextSibling);
   return wrap;
 }
-
 function setProgress(pct, label) {
   const wrap = ensureProgressBar();
   if (!wrap) return;
@@ -105,59 +101,54 @@ function setProgress(pct, label) {
   if (text) text.textContent = `${p.toFixed(1)}%${label ? ' • ' + label : ''}`;
 }
 
-function hideProgressBar() {
-  const wrap = document.getElementById('train-progress-wrap');
-  if (wrap) wrap.style.display = 'none';
-}
-
-// ---------- Backend selection (GH Pages) ----------
+// ---------- Backend (fast on GH Pages) ----------
 async function ensureBackend() {
   try { await tf.setBackend('webgl'); } catch (_) {}
   await tf.ready();
   updateStatus(`TensorFlow.js backend: ${tf.getBackend()}`);
 }
 
-// ---------- Model ----------
-function createModel(userCount, movieCount, latentDim = 24) {
+// ---------- Model (MF + biases + L2) ----------
+function createModel(userDim, movieDim, latentDim = 24) {
   const l2 = tf.regularizers.l2({ l2: 1e-6 });
   const seed = 1337;
   const glorot = tf.initializers.glorotUniform({ seed });
 
+  // Inputs MUST be int32 for embeddings
   const userInput = tf.input({ shape: [1], dtype: 'int32', name: 'userInput' });
   const movieInput = tf.input({ shape: [1], dtype: 'int32', name: 'movieInput' });
 
-  const userEmbedding = tf.layers.embedding({
-    inputDim: userCount + 1,
+  const userEmb = tf.layers.embedding({
+    inputDim: userDim + 1,
     outputDim: latentDim,
     embeddingsInitializer: glorot,
     embeddingsRegularizer: l2,
     name: 'userEmbedding'
   }).apply(userInput);
 
-  const movieEmbedding = tf.layers.embedding({
-    inputDim: movieCount + 1,
+  const movieEmb = tf.layers.embedding({
+    inputDim: movieDim + 1,
     outputDim: latentDim,
     embeddingsInitializer: glorot,
     embeddingsRegularizer: l2,
     name: 'movieEmbedding'
   }).apply(movieInput);
 
-  const userVec = tf.layers.flatten().apply(userEmbedding);
-  const movieVec = tf.layers.flatten().apply(movieEmbedding);
+  const u = tf.layers.flatten().apply(userEmb);
+  const v = tf.layers.flatten().apply(movieEmb);
 
-  const userBias = tf.layers.flatten().apply(
+  const ub = tf.layers.flatten().apply(
     tf.layers.embedding({
-      inputDim: userCount + 1,
+      inputDim: userDim + 1,
       outputDim: 1,
       embeddingsInitializer: 'zeros',
       embeddingsRegularizer: l2,
       name: 'userBias'
     }).apply(userInput)
   );
-
-  const movieBias = tf.layers.flatten().apply(
+  const vb = tf.layers.flatten().apply(
     tf.layers.embedding({
-      inputDim: movieCount + 1,
+      inputDim: movieDim + 1,
       outputDim: 1,
       embeddingsInitializer: 'zeros',
       embeddingsRegularizer: l2,
@@ -165,25 +156,21 @@ function createModel(userCount, movieCount, latentDim = 24) {
     }).apply(movieInput)
   );
 
-  const dot = tf.layers.dot({ axes: 1, name: 'dotUserMovie' }).apply([userVec, movieVec]);
-  const sum = tf.layers.add({ name: 'addBias' }).apply([dot, userBias, movieBias]);
-  const output = tf.layers.activation({ activation: 'linear', name: 'rating' }).apply(sum);
+  const dot = tf.layers.dot({ axes: 1, name: 'dotUserMovie' }).apply([u, v]);
+  const sum = tf.layers.add({ name: 'addBias' }).apply([dot, ub, vb]);
+  const out = tf.layers.activation({ activation: 'linear', name: 'rating' }).apply(sum);
 
-  return tf.model({ inputs: [userInput, movieInput], outputs: output, name: 'mf_recommender' });
+  return tf.model({ inputs: [userInput, movieInput], outputs: out, name: 'mf_recommender' });
 }
 
-// ---------- Training ----------
-function earlyStopping(patience = 2) {
-  let best = Infinity;
-  let wait = 0;
+// ---------- Training (big batch + early stop) ----------
+function makeEarlyStopping(patience = 2) {
+  let best = Infinity, wait = 0;
   return {
-    onEpochEnd: async (epoch, logs) => {
+    onEpochEnd: (_, logs) => {
       const cur = Number.isFinite(logs.val_loss) ? logs.val_loss : logs.loss;
       if (cur < best - 1e-4) { best = cur; wait = 0; }
-      else if (++wait >= patience) {
-        model.stopTraining = true;
-        updateStatus(`Early stopping at epoch ${epoch + 1} (best val_loss ${best.toFixed(4)}).`);
-      }
+      else if (++wait >= patience) { model.stopTraining = true; }
     }
   };
 }
@@ -197,79 +184,65 @@ async function trainModel() {
     ensureProgressBar();
     setProgress(0, 'Preparing…');
 
-    updateStatus('Building model…');
-    model = createModel(numUsers, numMovies, 24);
+    // Use MAX IDs for embedding sizes (robust to gaps in IDs)
+    model = createModel(maxUserId, maxMovieId, 24);
+    model.compile({ optimizer: tf.train.adam(0.002), loss: 'meanSquaredError', metrics: ['mae'] });
 
-    updateStatus('Compiling model…');
-    model.compile({
-      optimizer: tf.train.adam(0.002),
-      loss: 'meanSquaredError',
-      metrics: ['mae']
-    });
-
-    // Prepare data tensors (IMPORTANT: int32 indices for embeddings)
-    updateStatus('Preparing training data…');
-
+    // Build tensors (int32 indices!)
     const N = ratings.length;
-    const userIds = new Int32Array(N);
-    const movieIds = new Int32Array(N);
+    const uids = new Int32Array(N);
+    const mids = new Int32Array(N);
     const y = new Float32Array(N);
-
     for (let i = 0; i < N; i++) {
       const r = ratings[i];
-      userIds[i] = r.userId | 0;
-      movieIds[i] = r.movieId | 0;
+      uids[i] = r.userId | 0;
+      mids[i] = r.movieId | 0;
       y[i] = r.rating;
     }
 
-    // Center targets around global mean (improves MF stability)
-    let sum = 0; for (let i = 0; i < N; i++) sum += y[i];
-    globalMeanRating = sum / N;
-    for (let i = 0; i < N; i++) y[i] = y[i] - globalMeanRating;
+    // Center targets around global mean
+    let s = 0; for (let i = 0; i < N; i++) s += y[i];
+    globalMeanRating = s / N;
+    for (let i = 0; i < N; i++) y[i] -= globalMeanRating;
 
-    const Xuser = tf.tensor2d(userIds, [N, 1], 'int32');
-    const Xmovie = tf.tensor2d(movieIds, [N, 1], 'int32');
+    const Xuser = tf.tensor2d(uids, [N, 1], 'int32');
+    const Xmovie = tf.tensor2d(mids, [N, 1], 'int32');
     const Y = tf.tensor2d(y, [N, 1], 'float32');
 
-    // Batch & epochs
-    const isGPU = tf.getBackend() === 'webgl';
-    const batchSize = isGPU ? 1024 : 256;
-    const maxEpochs = 12;
+    const gpu = tf.getBackend() === 'webgl';
+    const batchSize = gpu ? 2048 : 256;
+    const epochs = 12;
     const valSplit = 0.1;
     const trainSize = Math.floor(N * (1 - valSplit));
     const stepsPerEpoch = Math.ceil(trainSize / batchSize);
 
-    // Progress callbacks
-    let currentEpoch = 0;
+    let epochIdx = 0;
     const progCb = {
       onTrainBegin: () => setProgress(0, 'Starting…'),
-      onEpochBegin: (epoch) => { currentEpoch = epoch; },
-      onBatchEnd: (batch) => {
-        const overall = ((currentEpoch + (batch + 1) / stepsPerEpoch) / maxEpochs) * 100;
-        setProgress(overall, `Epoch ${currentEpoch + 1}/${maxEpochs}`);
+      onEpochBegin: (e) => { epochIdx = e; },
+      onBatchEnd: (b) => {
+        const overall = ((epochIdx + (b + 1) / stepsPerEpoch) / epochs) * 100;
+        setProgress(overall, `Epoch ${epochIdx + 1}/${epochs}`);
       },
-      onEpochEnd: (epoch, logs) => {
-        const pct = ((epoch + 1) / maxEpochs) * 100;
-        setProgress(pct, `Epoch ${epoch + 1}/${maxEpochs} — val_loss ${logs.val_loss?.toFixed(4)}`);
-        updateStatus(
-          `Epoch ${epoch + 1} — loss: ${logs.loss.toFixed(4)} • val_loss: ${logs.val_loss?.toFixed(4)} • mae: ${logs.mae?.toFixed(4)}`
-        );
+      onEpochEnd: (e, logs) => {
+        const pct = ((e + 1) / epochs) * 100;
+        setProgress(pct, `Epoch ${e + 1}/${epochs} — val_loss ${logs.val_loss?.toFixed(4)}`);
+        updateStatus(`Epoch ${e + 1}: loss ${logs.loss.toFixed(4)} • val_loss ${logs.val_loss?.toFixed(4)} • mae ${logs.mae?.toFixed(4)}`);
       },
       onTrainEnd: () => setProgress(100, 'Finalizing…'),
     };
 
-    updateStatus(`Training (${N.toLocaleString()} ratings) — batch ${batchSize}, up to ${maxEpochs} epochs…`);
+    updateStatus(`Training ${N.toLocaleString()} ratings — batch ${batchSize}, up to ${epochs} epochs…`);
     await model.fit([Xuser, Xmovie], Y, {
-      epochs: maxEpochs,
-      batchSize,
-      shuffle: true,
-      validationSplit: valSplit,
-      callbacks: [progCb, earlyStopping(2)]
+      epochs, batchSize, shuffle: true, validationSplit: valSplit,
+      callbacks: [progCb, makeEarlyStopping(2)]
     });
 
-    tf.dispose([Xuser, Xmovie, Y]);
+    // Preallocate predict vars
+    predUserVar = tf.variable(tf.tensor2d([[0]], [1, 1], 'int32'));
+    predMovieVar = tf.variable(tf.tensor2d([[0]], [1, 1], 'int32'));
 
-    setProgress(100, 'Done');
+    tf.dispose([Xuser, Xmovie, Y]);
     updateStatus('Model ready. Select a user & movie, then click Predict.');
     if (btn) btn.disabled = false;
     isTraining = false;
@@ -296,12 +269,15 @@ async function predictRating() {
   }
 
   try {
-    const centered = await tf.tidy(() => {
-      const u = tf.tensor2d([[userId]], [1, 1], 'int32');
-      const m = tf.tensor2d([[movieId]], [1, 1], 'int32');
-      return model.predict([u, m]);
-    }).data();
+    if (!predUserVar || !predMovieVar) {
+      predUserVar = tf.variable(tf.tensor2d([[userId]], [1, 1], 'int32'));
+      predMovieVar = tf.variable(tf.tensor2d([[movieId]], [1, 1], 'int32'));
+    } else {
+      predUserVar.assign(tf.tensor2d([[userId]], [1, 1], 'int32'));
+      predMovieVar.assign(tf.tensor2d([[movieId]], [1, 1], 'int32'));
+    }
 
+    const centered = await tf.tidy(() => model.predict([predUserVar, predMovieVar])).data();
     const predicted = Math.min(5, Math.max(1, centered[0] + globalMeanRating));
 
     const movie = movies.find(x => x.id === movieId);
@@ -312,7 +288,7 @@ async function predictRating() {
     else if (predicted <= 2) cls = 'low';
 
     updateResult(
-      `Predicted rating for User ${userId} on “<strong>${title}</strong>”: <strong>${predicted.toFixed(2)}</strong>/5`,
+      `Predicted rating for User ${userId} on "<strong>${title}</strong>": <strong>${predicted.toFixed(2)}</strong>/5`,
       cls
     );
   } catch (err) {
@@ -325,8 +301,8 @@ async function predictRating() {
 window.onload = async () => {
   try {
     updateStatus('Initializing TensorFlow.js…');
-    await ensureBackend(); // WebGL on GH Pages
-    updateStatus('Loading MovieLens data… (files must be next to index.html)');
+    await ensureBackend();
+    updateStatus('Loading MovieLens data…');
     await loadData();
     populateUserDropdown();
     populateMovieDropdown();
