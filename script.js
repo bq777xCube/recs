@@ -1,23 +1,20 @@
-// ===== script.js (CPU-only, fast-as-possible + progress bar + caching) =====
-// Runs *only* on your laptop's CPU in the browser (no WebGL/WASM).
-// - Forces tfjs backend to 'cpu'
-// - Uses lean MF (latent=12), bigger batches, no val split, early stopping
-// - Centers targets + adds user/movie bias + L2
-// - Progress bar (throttled) to keep UI responsive
-// - Caches model in IndexedDB to skip retraining on repeat visits
+// ===== script.js (FORCE CPU • no WASM/WebGL) =====
+// Fixes "Kernel 'UnsortedSegmentSum' not registered for backend 'wasm'"
+// by unregistering WASM/WebGL and locking TensorFlow.js to CPU.
+// Includes: progress bar (throttled), CPU-tuned training, caching, robust IDs.
 
 let model = null;
 let isTraining = false;
 let globalMeanRating = 3.5;
 
-// Reused tiny tensors for quick predict()
+// Reused tiny tensors for fast predict()
 let predUserVar = null;
 let predMovieVar = null;
 
-// Optional: add ?fast=1 to URL to train on a ~60k sample for quick demo
+// Optional URL flags
 const params = new URLSearchParams(location.search);
-const FAST_MODE = params.has('fast');     // ?fast=1
-const NO_CACHE  = params.has('nocache');  // ?nocache=1 to ignore cached model
+const FAST_MODE = params.has('fast');     // ?fast=1 -> subsample ~60k rows for quicker training
+const NO_CACHE  = params.has('nocache');  // ?nocache=1 -> ignore cached model
 
 // ---------- UI helpers ----------
 function updateStatus(message, isError = false) {
@@ -33,12 +30,11 @@ function updateResult(message, className = '') {
   el.innerHTML = message;
   el.className = `result ${className}`;
 }
-
 function populateUserDropdown() {
   const sel = document.getElementById('user-select');
   sel.innerHTML = '';
-  // Prefer robust list from data.js; fallback to 1..numUsers
-  if (typeof userIdsSorted !== 'undefined' && Array.isArray(userIdsSorted) && userIdsSorted.length) {
+  // Use robust list from data.js (IDs might not be contiguous)
+  if (Array.isArray(userIdsSorted) && userIdsSorted.length) {
     for (const uid of userIdsSorted) {
       const opt = document.createElement('option');
       opt.value = uid;
@@ -55,7 +51,6 @@ function populateUserDropdown() {
   }
   sel.disabled = false;
 }
-
 function populateMovieDropdown() {
   const sel = document.getElementById('movie-select');
   sel.innerHTML = '';
@@ -68,10 +63,11 @@ function populateMovieDropdown() {
   sel.disabled = false;
 }
 
-// ---------- Progress bar (throttled) ----------
+// ---------- Progress bar (throttled to keep UI cheap) ----------
 function ensureProgressBar() {
   let wrap = document.getElementById('train-progress-wrap');
   if (wrap) return wrap;
+
   const status = document.getElementById('status');
   if (!status) return null;
 
@@ -110,9 +106,8 @@ function ensureProgressBar() {
 let _lastUiUpdate = 0;
 function setProgress(pct, label) {
   const now = performance.now();
-  if (now - _lastUiUpdate < 120) return; // ~8 fps
+  if (now - _lastUiUpdate < 120) return; // ~8 fps to reduce DOM work
   _lastUiUpdate = now;
-
   ensureProgressBar();
   const fill = document.getElementById('train-progress-fill');
   const text = document.getElementById('train-progress-text');
@@ -121,16 +116,21 @@ function setProgress(pct, label) {
   if (text) text.textContent = `${p.toFixed(1)}%${label ? ' • ' + label : ''}`;
 }
 
-// ---------- Force CPU backend ----------
-async function ensureBackend() {
-  await tf.setBackend('cpu');   // <- force CPU
+// ---------- Backend: HARD-LOCK to CPU & unregister WASM/WebGL ----------
+async function ensureCpuOnly() {
+  try { if (typeof tf.findBackend === 'function' && tf.findBackend('wasm')) tf.removeBackend('wasm'); } catch {}
+  try { if (typeof tf.findBackend === 'function' && tf.findBackend('webgl')) tf.removeBackend('webgl'); } catch {}
+  await tf.setBackend('cpu');
   await tf.ready();
-  updateStatus('TensorFlow.js backend: cpu');
-  return 'cpu';
+  const active = tf.getBackend();
+  updateStatus(`TensorFlow.js backend: ${active}`);
+  if (active !== 'cpu') {
+    throw new Error(`Expected CPU backend, got "${active}". Make sure no script loads tfjs-backend-wasm/webgl.`);
+  }
 }
 
 // ---------- Model (MF + biases + L2) ----------
-function createModel(userDim, movieDim, latentDim = 12) { // leaner dims = faster on CPU
+function createModel(userDim, movieDim, latentDim = 12) { // smaller = faster on CPU
   const l2 = tf.regularizers.l2({ l2: 1e-6 });
   const glorot = tf.initializers.glorotUniform({ seed: 1337 });
 
@@ -174,7 +174,7 @@ function createModel(userDim, movieDim, latentDim = 12) { // leaner dims = faste
 function dataSignature() {
   const uDim = (typeof maxUserId !== 'undefined' && maxUserId) ? maxUserId : numUsers;
   const mDim = (typeof maxMovieId !== 'undefined' && maxMovieId) ? maxMovieId : numMovies;
-  return `cpu-v1-u${uDim}-m${mDim}-n${ratings.length}`;
+  return `cpu-lock-v2-u${uDim}-m${mDim}-n${ratings.length}`;
 }
 async function tryLoadCachedModel(sig) {
   if (NO_CACHE) return false;
@@ -187,7 +187,7 @@ async function tryLoadCachedModel(sig) {
     predMovieVar = tf.variable(tf.tensor2d([[0]], [1, 1], 'int32'));
     document.getElementById('predict-btn').disabled = false;
     return true;
-  } catch (_) { return false; }
+  } catch { return false; }
 }
 async function saveCachedModel(sig) {
   try {
@@ -209,7 +209,7 @@ function maybeSubsample(arr, target = 60000) {
   return res;
 }
 
-// ---------- Training (CPU-optimized) ----------
+// ---------- Training (CPU-tuned) ----------
 function earlyStopping(pat = 1) {
   let best = Infinity, wait = 0;
   return { onEpochEnd: (_, logs) => {
@@ -224,21 +224,19 @@ async function trainModel() {
   try {
     isTraining = true;
     if (btn) btn.disabled = true;
-
     ensureProgressBar();
     setProgress(0, 'Preparing…');
 
-    // Embedding dims (robust to gaps)
+    // Robust embedding dims
     const userDim = (typeof maxUserId !== 'undefined' && maxUserId) ? maxUserId : numUsers;
     const movieDim = (typeof maxMovieId !== 'undefined' && maxMovieId) ? maxMovieId : numMovies;
 
     model = createModel(userDim, movieDim, 12);
     model.compile({ optimizer: tf.train.adam(0.004), loss: 'meanSquaredError', metrics: ['mae'] });
 
-    // Optionally subsample for faster demo
     const trainRatings = maybeSubsample(ratings);
-
     const N = trainRatings.length;
+
     const uids = new Int32Array(N);
     const mids = new Int32Array(N);
     const y    = new Float32Array(N);
@@ -249,7 +247,7 @@ async function trainModel() {
       y[i] = r.rating;
     }
 
-    // Center targets around mean
+    // Center targets
     let s = 0; for (let i = 0; i < N; i++) s += y[i];
     globalMeanRating = s / N;
     for (let i = 0; i < N; i++) y[i] -= globalMeanRating;
@@ -258,15 +256,14 @@ async function trainModel() {
     const Xmovie = tf.tensor2d(mids, [N, 1], 'int32');
     const Y      = tf.tensor2d(y,    [N, 1], 'float32');
 
-    // CPU-aimed batch/epochs
+    // CPU batch/epochs (bigger batch helps; early stop trims)
     const threads = Math.max(2, Math.min(8, (navigator.hardwareConcurrency || 4)));
-    const BATCH  = threads >= 8 ? 1024 : 512; // larger batch helps CPU throughput
-    const EPOCHS = 6;                         // early stopping will usually cut earlier
-    const VAL_SPLIT = 0.0;                    // fastest; monitor training loss
+    const BATCH  = threads >= 8 ? 1024 : 512;
+    const EPOCHS = 6;
+    const VAL_SPLIT = 0.0; // fastest; monitor training loss
 
     const stepsPerEpoch = Math.ceil(N / BATCH);
     let epochIdx = 0;
-
     const progCb = {
       onTrainBegin: () => setProgress(0, 'Starting…'),
       onEpochBegin: (e) => { epochIdx = e; },
@@ -282,9 +279,7 @@ async function trainModel() {
       onTrainEnd: () => setProgress(100, 'Finalizing…'),
     };
 
-    updateStatus(
-      `Training ${N.toLocaleString()} ratings — batch ${BATCH}, up to ${EPOCHS} epochs${FAST_MODE ? ' (FAST mode)' : ''}…`
-    );
+    updateStatus(`Training ${N.toLocaleString()} ratings — batch ${BATCH}, up to ${EPOCHS} epochs${FAST_MODE ? ' (FAST mode)' : ''}…`);
 
     await model.fit([Xuser, Xmovie], Y, {
       epochs: EPOCHS,
@@ -358,14 +353,14 @@ async function predictRating() {
 window.onload = async () => {
   try {
     updateStatus('Initializing TensorFlow.js…');
-    await ensureBackend();                // force CPU
+    await ensureCpuOnly();               // unregister WASM/WebGL, lock to CPU
 
     updateStatus('Loading MovieLens data…');
-    await loadData();                     // from data.js
+    await loadData();                    // from data.js
     populateUserDropdown();
     populateMovieDropdown();
 
-    // Try cached model first (instant after the first successful train)
+    // Try cached model first
     const sig = dataSignature();
     const cached = await tryLoadCachedModel(sig);
 
