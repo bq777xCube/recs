@@ -3,94 +3,42 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>PenguAI — Matrix Factorization Movie Recommender</title>
+  <title>Matrix Factorization Movie Recommender</title>
   <link rel="stylesheet" href="style.css"/>
-  <!-- TensorFlow.js (browser) -->
-  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.20.0/dist/tf.min.js"></script>
 </head>
 <body>
-  <!-- fun bg blobs -->
-  <div class="bg-blur bg1"></div>
-  <div class="bg-blur bg2"></div>
-
-  <header class="nav">
-    <div class="brand">
-      <div class="penguin" aria-hidden="true">
-        <div class="p-body">
-          <div class="p-belly"></div>
-          <div class="p-eye left"></div>
-          <div class="p-eye right"></div>
-          <div class="p-beak"></div>
-          <div class="p-feet"></div>
-        </div>
-      </div>
-      <span class="brand-name">PenguAI</span>
-    </div>
-    <div class="tag">matrix factorization · tf.js</div>
-  </header>
-
-  <main class="container">
-    <section class="hero">
+  <div class="container">
+    <header>
       <h1>Matrix Factorization Movie Recommender</h1>
-      <p class="sub">Train a collaborative model in your browser and predict ratings.</p>
-    </section>
+      <p>Train a collaborative filtering model in your browser using TensorFlow.js</p>
+    </header>
 
-    <section class="panel">
-      <div class="grid">
-        <label class="control">
-          <span class="label">Select User</span>
+    <main>
+      <div class="controls">
+        <div class="input-group">
+          <label for="user-select">Select User:</label>
           <select id="user-select">
-            <option value="" disabled selected>Loading…</option>
+            <option value="">Loading users...</option>
           </select>
-        </label>
-
-        <label class="control">
-          <span class="label">Select Movie</span>
-          <select id="movie-select">
-            <option value="" disabled selected>Loading…</option>
-          </select>
-        </label>
-
-        <label class="control">
-          <span class="label">Latent Dim (K)</span>
-          <input id="k-input" type="number" min="4" max="128" value="20"/>
-        </label>
-
-        <label class="control">
-          <span class="label">Epochs</span>
-          <input id="epochs-input" type="number" min="1" max="200" value="15"/>
-        </label>
-
-        <label class="control">
-          <span class="label">Learning Rate</span>
-          <input id="lr-input" type="number" step="0.001" min="0.001" max="0.5" value="0.05"/>
-        </label>
-
-        <div class="buttons">
-          <button id="train-btn" class="btn" onclick="trainModel()">
-            🐧 Train Model
-          </button>
-          <button id="predict-btn" class="btn ghost" onclick="predictRating()" disabled>
-            Predict Rating
-          </button>
         </div>
+
+        <div class="input-group">
+          <label for="movie-select">Select Movie:</label>
+          <select id="movie-select">
+            <option value="">Loading movies...</option>
+          </select>
+        </div>
+
+        <button id="predict-btn" onclick="predictRating()" disabled>Predict Rating</button>
       </div>
 
-      <div id="status" class="status">
-        <div id="status-line" class="muted">Loading data…</div>
-        <div id="meter" class="meter"><span id="bar"></span></div>
-      </div>
+      <div id="status" class="status">Loading data and training model...</div>
+      <div id="result" class="result"></div>
+    </main>
+  </div>
 
-      <div id="result-box" class="result-box">
-        <p id="result" class="muted">Model not trained yet.</p>
-      </div>
-    </section>
-
-    <footer class="footer">
-      <span>Made with ❤️ & a colony of penguins.</span>
-    </footer>
-  </main>
-
+  <!-- Load TensorFlow.js first, then our data module, then our main script -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@latest/dist/tf.min.js"></script>
   <script src="data.js"></script>
   <script src="script.js"></script>
 </body>
