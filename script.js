@@ -145,7 +145,7 @@ function buildDenseIdMaps() {
 }
 
 // ---------- Model (MF + biases + L2) ----------
-function createModel(uCount, mCount, latentDim = 10) { // leaner factors for CPU
+function createModel(uCount, mCount, latentDim = 8) { // leaner factors for CPU
   const l2 = tf.regularizers.l2({ l2: 1e-6 });
   const glorot = tf.initializers.glorotUniform({ seed: 1337 });
 
