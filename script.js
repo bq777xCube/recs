@@ -1,14 +1,20 @@
-// ===== script.js (FAST + robust IDs + progress bar) =====
+// ===== script.js (ultra-fast, GH Pages friendly) =====
+// Speed levers:
+//  • Prefer WebGL; if unavailable, auto-load WASM backend.
+//  • Mixed precision on WebGL (FP16 textures).
+//  • Big batches (WebGL 4096, WASM 1024, CPU 256) + early stopping.
+//  • Centered targets, user/movie bias, L2 regularization.
+//  • Progress bar; preallocated tensors for prediction.
 
 let model = null;
 let isTraining = false;
 let globalMeanRating = 3.5;
 
-// Reusable tensors to avoid allocs on every predict()
+// Reusable 1x1 tensors for prediction (avoid alloc on every click)
 let predUserVar = null;
 let predMovieVar = null;
 
-// ---------- UI helpers ----------
+// ---------- UI ----------
 function updateStatus(message, isError = false) {
   const el = document.getElementById('status');
   if (!el) return;
@@ -16,19 +22,16 @@ function updateStatus(message, isError = false) {
   el.style.borderLeftColor = isError ? '#e74c3c' : '#3498db';
   el.style.background = isError ? '#fdedec' : '#f8f9fa';
 }
-
 function updateResult(message, className = '') {
   const el = document.getElementById('result');
   if (!el) return;
   el.innerHTML = message;
   el.className = `result ${className}`;
 }
-
 function populateUserDropdown() {
   const sel = document.getElementById('user-select');
   sel.innerHTML = '';
-  // Use actual IDs (works even if not contiguous)
-  for (const uid of userIdsSorted) {
+  for (const uid of userIdsSorted) {        // robust to non-contiguous IDs
     const opt = document.createElement('option');
     opt.value = uid;
     opt.textContent = `User ${uid}`;
@@ -36,7 +39,6 @@ function populateUserDropdown() {
   }
   sel.disabled = false;
 }
-
 function populateMovieDropdown() {
   const sel = document.getElementById('movie-select');
   sel.innerHTML = '';
@@ -49,11 +51,10 @@ function populateMovieDropdown() {
   sel.disabled = false;
 }
 
-// ---------- Progress bar (injected) ----------
+// ---------- Progress bar ----------
 function ensureProgressBar() {
   let wrap = document.getElementById('train-progress-wrap');
   if (wrap) return wrap;
-
   const status = document.getElementById('status');
   if (!status) return null;
 
@@ -62,7 +63,6 @@ function ensureProgressBar() {
   wrap.style.margin = '12px 0 6px';
 
   const bar = document.createElement('div');
-  bar.id = 'train-progress';
   bar.style.width = '100%';
   bar.style.height = '10px';
   bar.style.background = '#eef3f7';
@@ -87,51 +87,68 @@ function ensureProgressBar() {
   bar.appendChild(fill);
   wrap.appendChild(bar);
   wrap.appendChild(text);
-
   status.parentElement.insertBefore(wrap, status.nextSibling);
   return wrap;
 }
 function setProgress(pct, label) {
-  const wrap = ensureProgressBar();
-  if (!wrap) return;
-  const p = Math.max(0, Math.min(100, pct));
+  ensureProgressBar();
   const fill = document.getElementById('train-progress-fill');
   const text = document.getElementById('train-progress-text');
+  const p = Math.max(0, Math.min(100, pct));
   if (fill) fill.style.width = `${p}%`;
   if (text) text.textContent = `${p.toFixed(1)}%${label ? ' • ' + label : ''}`;
 }
 
-// ---------- Backend (fast on GH Pages) ----------
+// ---------- Backend selection (fastest first) ----------
+function loadScript(src) {
+  return new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = src;
+    s.onload = resolve;
+    s.onerror = () => reject(new Error(`Failed to load ${src}`));
+    document.head.appendChild(s);
+  });
+}
 async function ensureBackend() {
-  try { await tf.setBackend('webgl'); } catch (_) {}
+  // Prefer WebGL (GPU). If it fails, try WASM (SIMD where supported).
+  try {
+    await tf.setBackend('webgl');
+  } catch (_) {}
   await tf.ready();
+
+  if (tf.getBackend() !== 'webgl') {
+    updateStatus('WebGL not available — loading WASM backend for speed…');
+    await loadScript('https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-wasm@latest/dist/tf-backend-wasm.js');
+    if (tf.wasm && tf.wasm.setWasmPaths) {
+      tf.wasm.setWasmPaths('https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-wasm@latest/dist/');
+    }
+    await tf.setBackend('wasm');
+    await tf.ready();
+  } else {
+    // Speed mode: use FP16 textures for higher throughput on GPU
+    try { tf.env().set('WEBGL_FORCE_F16_TEXTURES', true); } catch (_) {}
+    try { tf.env().set('WEBGL_PACK', true); } catch (_) {}
+  }
+
   updateStatus(`TensorFlow.js backend: ${tf.getBackend()}`);
 }
 
-// ---------- Model (MF + biases + L2) ----------
-function createModel(userDim, movieDim, latentDim = 24) {
+// ---------- Model ----------
+function createModel(userDim, movieDim, latentDim = 16) { // leaner factors => faster
   const l2 = tf.regularizers.l2({ l2: 1e-6 });
-  const seed = 1337;
-  const glorot = tf.initializers.glorotUniform({ seed });
+  const glorot = tf.initializers.glorotUniform({ seed: 1337 });
 
-  // Inputs MUST be int32 for embeddings
-  const userInput = tf.input({ shape: [1], dtype: 'int32', name: 'userInput' });
+  const userInput  = tf.input({ shape: [1], dtype: 'int32', name: 'userInput' });
   const movieInput = tf.input({ shape: [1], dtype: 'int32', name: 'movieInput' });
 
   const userEmb = tf.layers.embedding({
-    inputDim: userDim + 1,
-    outputDim: latentDim,
-    embeddingsInitializer: glorot,
-    embeddingsRegularizer: l2,
-    name: 'userEmbedding'
+    inputDim: userDim + 1, outputDim: latentDim,
+    embeddingsInitializer: glorot, embeddingsRegularizer: l2, name: 'userEmbedding'
   }).apply(userInput);
 
   const movieEmb = tf.layers.embedding({
-    inputDim: movieDim + 1,
-    outputDim: latentDim,
-    embeddingsInitializer: glorot,
-    embeddingsRegularizer: l2,
-    name: 'movieEmbedding'
+    inputDim: movieDim + 1, outputDim: latentDim,
+    embeddingsInitializer: glorot, embeddingsRegularizer: l2, name: 'movieEmbedding'
   }).apply(movieInput);
 
   const u = tf.layers.flatten().apply(userEmb);
@@ -139,32 +156,26 @@ function createModel(userDim, movieDim, latentDim = 24) {
 
   const ub = tf.layers.flatten().apply(
     tf.layers.embedding({
-      inputDim: userDim + 1,
-      outputDim: 1,
-      embeddingsInitializer: 'zeros',
-      embeddingsRegularizer: l2,
-      name: 'userBias'
+      inputDim: userDim + 1, outputDim: 1,
+      embeddingsInitializer: 'zeros', embeddingsRegularizer: l2, name: 'userBias'
     }).apply(userInput)
   );
   const vb = tf.layers.flatten().apply(
     tf.layers.embedding({
-      inputDim: movieDim + 1,
-      outputDim: 1,
-      embeddingsInitializer: 'zeros',
-      embeddingsRegularizer: l2,
-      name: 'movieBias'
+      inputDim: movieDim + 1, outputDim: 1,
+      embeddingsInitializer: 'zeros', embeddingsRegularizer: l2, name: 'movieBias'
     }).apply(movieInput)
   );
 
-  const dot = tf.layers.dot({ axes: 1, name: 'dotUserMovie' }).apply([u, v]);
-  const sum = tf.layers.add({ name: 'addBias' }).apply([dot, ub, vb]);
-  const out = tf.layers.activation({ activation: 'linear', name: 'rating' }).apply(sum);
+  const dot = tf.layers.dot({ axes: 1 }).apply([u, v]);
+  const sum = tf.layers.add().apply([dot, ub, vb]);
+  const out = tf.layers.activation({ activation: 'linear' }).apply(sum);
 
-  return tf.model({ inputs: [userInput, movieInput], outputs: out, name: 'mf_recommender' });
+  return tf.model({ inputs: [userInput, movieInput], outputs: out });
 }
 
-// ---------- Training (big batch + early stop) ----------
-function makeEarlyStopping(patience = 2) {
+// ---------- Training ----------
+function earlyStopping(patience = 1) {
   let best = Infinity, wait = 0;
   return {
     onEpochEnd: (_, logs) => {
@@ -184,15 +195,14 @@ async function trainModel() {
     ensureProgressBar();
     setProgress(0, 'Preparing…');
 
-    // Use MAX IDs for embedding sizes (robust to gaps in IDs)
-    model = createModel(maxUserId, maxMovieId, 24);
-    model.compile({ optimizer: tf.train.adam(0.002), loss: 'meanSquaredError', metrics: ['mae'] });
+    model = createModel(maxUserId, maxMovieId, 16);
+    model.compile({ optimizer: tf.train.adam(0.003), loss: 'meanSquaredError', metrics: ['mae'] });
 
-    // Build tensors (int32 indices!)
+    // Build training tensors (int32 indices!)
     const N = ratings.length;
     const uids = new Int32Array(N);
     const mids = new Int32Array(N);
-    const y = new Float32Array(N);
+    const y    = new Float32Array(N);
     for (let i = 0; i < N; i++) {
       const r = ratings[i];
       uids[i] = r.userId | 0;
@@ -200,7 +210,7 @@ async function trainModel() {
       y[i] = r.rating;
     }
 
-    // Center targets around global mean
+    // Center targets
     let s = 0; for (let i = 0; i < N; i++) s += y[i];
     globalMeanRating = s / N;
     for (let i = 0; i < N; i++) y[i] -= globalMeanRating;
@@ -209,9 +219,10 @@ async function trainModel() {
     const Xmovie = tf.tensor2d(mids, [N, 1], 'int32');
     const Y = tf.tensor2d(y, [N, 1], 'float32');
 
-    const gpu = tf.getBackend() === 'webgl';
-    const batchSize = gpu ? 2048 : 256;
-    const epochs = 12;
+    // Choose aggressive batch sizes
+    const backend = tf.getBackend();
+    const batchSize = backend === 'webgl' ? 4096 : backend === 'wasm' ? 1024 : 256;
+    const epochs = 8;             // fewer epochs; early stopping will cut earlier if converged
     const valSplit = 0.1;
     const trainSize = Math.floor(N * (1 - valSplit));
     const stepsPerEpoch = Math.ceil(trainSize / batchSize);
@@ -235,14 +246,15 @@ async function trainModel() {
     updateStatus(`Training ${N.toLocaleString()} ratings — batch ${batchSize}, up to ${epochs} epochs…`);
     await model.fit([Xuser, Xmovie], Y, {
       epochs, batchSize, shuffle: true, validationSplit: valSplit,
-      callbacks: [progCb, makeEarlyStopping(2)]
+      callbacks: [progCb, earlyStopping(1)]
     });
 
-    // Preallocate predict vars
-    predUserVar = tf.variable(tf.tensor2d([[0]], [1, 1], 'int32'));
+    // Prepare fast prediction path
+    predUserVar  = tf.variable(tf.tensor2d([[0]], [1, 1], 'int32'));
     predMovieVar = tf.variable(tf.tensor2d([[0]], [1, 1], 'int32'));
 
     tf.dispose([Xuser, Xmovie, Y]);
+
     updateStatus('Model ready. Select a user & movie, then click Predict.');
     if (btn) btn.disabled = false;
     isTraining = false;
@@ -260,7 +272,6 @@ async function predictRating() {
     updateResult('Model is still training. Please wait…', 'medium');
     return;
   }
-
   const userId = parseInt(document.getElementById('user-select').value, 10);
   const movieId = parseInt(document.getElementById('movie-select').value, 10);
   if (!userId || !movieId) {
@@ -270,7 +281,7 @@ async function predictRating() {
 
   try {
     if (!predUserVar || !predMovieVar) {
-      predUserVar = tf.variable(tf.tensor2d([[userId]], [1, 1], 'int32'));
+      predUserVar  = tf.variable(tf.tensor2d([[userId]], [1, 1], 'int32'));
       predMovieVar = tf.variable(tf.tensor2d([[movieId]], [1, 1], 'int32'));
     } else {
       predUserVar.assign(tf.tensor2d([[userId]], [1, 1], 'int32'));
@@ -288,7 +299,7 @@ async function predictRating() {
     else if (predicted <= 2) cls = 'low';
 
     updateResult(
-      `Predicted rating for User ${userId} on "<strong>${title}</strong>": <strong>${predicted.toFixed(2)}</strong>/5`,
+      `Predicted rating for User ${userId} on “<strong>${title}</strong>”: <strong>${predicted.toFixed(2)}</strong>/5`,
       cls
     );
   } catch (err) {
@@ -301,9 +312,9 @@ async function predictRating() {
 window.onload = async () => {
   try {
     updateStatus('Initializing TensorFlow.js…');
-    await ensureBackend();
+    await ensureBackend(); // WebGL → WASM fallback
     updateStatus('Loading MovieLens data…');
-    await loadData();
+    await loadData();      // from data.js
     populateUserDropdown();
     populateMovieDropdown();
     updateStatus('Data loaded. Starting training…');
