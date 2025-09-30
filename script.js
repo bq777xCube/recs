@@ -1,28 +1,27 @@
-// ===== script.js (CPU-only • ULTRA mode for ~2× speed) =====
-// How to go even faster:
-//   Add ?ultra=1 to URL  -> latent=8, no biases, LR up, batch up, epochs down, subsample ~40k
-//   Add ?fast=1          -> subsample ~60k (normal mode)
-// Always caches to IndexedDB after the first successful train.
+// ===== script.js (CPU-only • 1 EPOCH ONLY • dense IDs • caching) =====
+// - Hard-locks to CPU (no WASM/WebGL) to avoid kernel errors
+// - Dense ID mapping (shrinks embeddings => faster per step)
+// - 1 epoch training with higher LR + big batches
+// - Throttled progress bar + IndexedDB caching
 
 let model = null;
 let isTraining = false;
 let globalMeanRating = 3.5;
 
-// Reused tiny tensors for predict()
+// Tiny reusable tensors for predict()
 let predUserVar = null;
 let predMovieVar = null;
 
-// Dense ID maps (original ID -> dense index)
-let userIdToIdx = null;  // Map<number, number>  (1..U)
-let movieIdToIdx = null; // Map<number, number>  (1..M)
+// Dense ID maps (original ID -> dense index starting at 1)
+let userIdToIdx = null;
+let movieIdToIdx = null;
 let userCount = 0;
 let movieCount = 0;
 
 // URL flags
-const params   = new URLSearchParams(location.search);
-const ULTRA    = params.has('ultra');   // ?ultra=1  -> max speed (lower accuracy)
-const FAST_MODE= params.has('fast');    // ?fast=1   -> subsample ~60k (normal mode)
-const NO_CACHE = params.has('nocache'); // ?nocache=1
+const params    = new URLSearchParams(location.search);
+const FAST_MODE = params.has('fast');     // ?fast=1 -> subsample ~60k for quicker single-epoch
+const NO_CACHE  = params.has('nocache');  // ?nocache=1 -> ignore cache this session
 
 // ---------- UI ----------
 function updateStatus(message, isError = false) {
@@ -64,7 +63,7 @@ function populateMovieDropdown() {
   sel.disabled = false;
 }
 
-// ---------- Progress bar (coarser to cut DOM cost) ----------
+// ---------- Progress bar (throttled) ----------
 function ensureProgressBar() {
   let wrap = document.getElementById('train-progress-wrap');
   if (wrap) return wrap;
@@ -104,10 +103,9 @@ function ensureProgressBar() {
   return wrap;
 }
 let _lastUiUpdate = 0;
-const UI_THROTTLE_MS = ULTRA ? 220 : 140; // coarser in ULTRA
 function setProgress(pct, label) {
   const now = performance.now();
-  if (now - _lastUiUpdate < UI_THROTTLE_MS) return;
+  if (now - _lastUiUpdate < 180) return; // ~5-6 fps to keep DOM cheap
   _lastUiUpdate = now;
   ensureProgressBar();
   const fill = document.getElementById('train-progress-fill');
@@ -119,12 +117,12 @@ function setProgress(pct, label) {
 
 // ---------- Backend: HARD-LOCK CPU ----------
 async function ensureCpuOnly() {
-  try { if (typeof tf.findBackend === 'function' && tf.findBackend('wasm')) tf.removeBackend('wasm'); } catch {}
-  try { if (typeof tf.findBackend === 'function' && tf.findBackend('webgl')) tf.removeBackend('webgl'); } catch {}
+  try { tf.removeBackend('wasm'); } catch {}
+  try { tf.removeBackend('webgl'); } catch {}
   await tf.setBackend('cpu');
   await tf.ready();
   const active = tf.getBackend();
-  updateStatus(`TensorFlow.js backend: ${active}${ULTRA ? ' • ULTRA' : ''}`);
+  updateStatus(`TensorFlow.js backend: ${active}`);
   if (active !== 'cpu') throw new Error(`Expected CPU backend, got "${active}"`);
 }
 
@@ -135,15 +133,15 @@ function buildDenseIdMaps() {
     : Array.from(new Set(ratings.map(r => r.userId))).sort((a,b)=>a-b);
   userCount = users.length;
   userIdToIdx = new Map();
-  users.forEach((uid, i) => userIdToIdx.set(uid, i + 1)); // 1-based
+  users.forEach((uid, i) => userIdToIdx.set(uid, i + 1)); // 1-based indices
 
   movieCount = movies.length;
   movieIdToIdx = new Map();
-  movies.forEach((m, i) => movieIdToIdx.set(m.id, i + 1)); // 1-based
+  movies.forEach((m, i) => movieIdToIdx.set(m.id, i + 1)); // 1-based indices
 }
 
-// ---------- Model (MF; biases optional) ----------
-function createModel(uCount, mCount, latentDim = 8, withBias = true) {
+// ---------- Model (MF + biases + L2) ----------
+function createModel(uCount, mCount, latentDim = 8) { // latent=8 as requested
   const l2 = tf.regularizers.l2({ l2: 1e-6 });
   const glorot = tf.initializers.glorotUniform({ seed: 1337 });
 
@@ -162,11 +160,6 @@ function createModel(uCount, mCount, latentDim = 8, withBias = true) {
 
   const u = tf.layers.flatten().apply(userEmb);
   const v = tf.layers.flatten().apply(movieEmb);
-  const dot = tf.layers.dot({ axes: 1 }).apply([u, v]);
-
-  if (!withBias) {
-    return tf.model({ inputs: [userInput, movieInput], outputs: dot });
-  }
 
   const ub = tf.layers.flatten().apply(
     tf.layers.embedding({
@@ -181,16 +174,15 @@ function createModel(uCount, mCount, latentDim = 8, withBias = true) {
     }).apply(movieInput)
   );
 
+  const dot = tf.layers.dot({ axes: 1 }).apply([u, v]);
   const sum = tf.layers.add().apply([dot, ub, vb]);
   return tf.model({ inputs: [userInput, movieInput], outputs: sum });
 }
 
-// ---------- Cache helpers ----------
+// ---------- Cache ----------
 function dataSignature() {
-  // include key knobs so cache invalidates when changing speed/shape
-  const mode = ULTRA ? 'ultra' : 'normal';
-  const bias = ULTRA ? 'nobias' : 'bias';
-  return `cpu-dense-v2-${mode}-${bias}-u${userCount}-m${movieCount}-n${ratings.length}`;
+  // include shape + 1-epoch marker so cache invalidates if dataset changes
+  return `cpu-dense-e1-u${userCount}-m${movieCount}-n${ratings.length}-k8`;
 }
 async function tryLoadCachedModel(sig) {
   if (NO_CACHE) return false;
@@ -212,7 +204,7 @@ async function saveCachedModel(sig) {
   } catch (e) { console.warn('Cache save failed:', e); }
 }
 
-// Subsample helpers
+// Optional subsample for quicker single-epoch (first run)
 function reservoirSample(arr, target) {
   if (arr.length <= target) return arr;
   const k = target;
@@ -225,21 +217,11 @@ function reservoirSample(arr, target) {
   return res;
 }
 function maybeSubsample(arr) {
-  if (ULTRA) return reservoirSample(arr, 40000);
   if (FAST_MODE) return reservoirSample(arr, 60000);
   return arr;
 }
 
-// ---------- Training ----------
-function earlyStopping(pat = 1) {
-  let best = Infinity, wait = 0;
-  return { onEpochEnd: (_, logs) => {
-    const cur = Number.isFinite(logs.val_loss) ? logs.val_loss : logs.loss;
-    if (cur < best - 1e-4) { best = cur; wait = 0; }
-    else if (++wait >= pat) { model.stopTraining = true; }
-  }};
-}
-
+// ---------- Training (1 EPOCH ONLY) ----------
 async function trainModel() {
   const btn = document.getElementById('predict-btn');
   try {
@@ -249,17 +231,13 @@ async function trainModel() {
     ensureProgressBar();
     setProgress(0, 'Preparing…');
 
+    // Build dense maps and model
     buildDenseIdMaps();
+    model = createModel(userCount, movieCount, 8);
+    // Higher LR to make 1 pass count
+    model.compile({ optimizer: tf.train.adam(0.008), loss: 'meanSquaredError' });
 
-    const latent = 8; // you asked for 8; good for speed
-    const withBias = !ULTRA; // drop biases in ULTRA for speed
-    model = createModel(userCount, movieCount, latent, withBias);
-
-    // Higher LR + fewer epochs (ULTRA converges quickly)
-    const lr     = ULTRA ? 0.008 : 0.004;
-    const epochs = ULTRA ? 3     : 6;
-    model.compile({ optimizer: tf.train.adam(lr), loss: 'meanSquaredError' }); // no extra metrics
-
+    // Prepare tensors
     const trainRatings = maybeSubsample(ratings);
     const N = trainRatings.length;
 
@@ -282,45 +260,42 @@ async function trainModel() {
     const Xmovie = tf.tensor2d(mids, [N, 1], 'int32');
     const Y      = tf.tensor2d(y,    [N, 1], 'float32');
 
-    // Bigger batches on CPU help (keep memory reasonable)
+    // CPU big batch to reduce steps
     const threads = Math.max(2, Math.min(8, (navigator.hardwareConcurrency || 4)));
-    const batch = ULTRA ? (threads >= 8 ? 2048 : 1536) : (threads >= 8 ? 1024 : 512);
-    const stepsPerEpoch = Math.ceil(N / batch);
+    const BATCH  = threads >= 8 ? 2048 : 1536;
+    const EPOCHS = 1; // <<— single epoch
+    const stepsPerEpoch = Math.ceil(N / BATCH);
 
     let epochIdx = 0;
-    // Update UI every few batches in ULTRA to reduce DOM work further
-    const BATCH_UI_STEP = ULTRA ? 4 : 1;
-
+    const BATCH_UI_STEP = 4; // update UI every 4 batches for lower DOM overhead
     const progCb = {
       onTrainBegin: () => setProgress(0, 'Starting…'),
       onEpochBegin: (e) => { epochIdx = e; },
       onBatchEnd: (b) => {
-        if ((b + 1) % BATCH_UI_STEP !== 0) return; // coarser UI
-        const overall = ((epochIdx + (b + 1) / stepsPerEpoch) / epochs) * 100;
-        setProgress(overall, `Epoch ${epochIdx + 1}/${epochs}`);
+        if ((b + 1) % BATCH_UI_STEP !== 0) return;
+        const overall = ((epochIdx + (b + 1) / stepsPerEpoch) / EPOCHS) * 100;
+        setProgress(overall, `Epoch ${epochIdx + 1}/${EPOCHS}`);
       },
       onEpochEnd: (e, logs) => {
-        const pct = ((e + 1) / epochs) * 100;
-        setProgress(pct, `Epoch ${e + 1}/${epochs} — loss ${logs.loss.toFixed(4)}`);
-        // Keep status light in ULTRA
-        if (!ULTRA) updateStatus(`Epoch ${e + 1}: loss ${logs.loss.toFixed(4)}`);
+        setProgress(100, `Epoch ${e + 1}/${EPOCHS} — loss ${logs.loss.toFixed(4)}`);
+        updateStatus(`Epoch ${e + 1}: loss ${logs.loss.toFixed(4)}`);
       },
       onTrainEnd: () => setProgress(100, 'Finalizing…'),
     };
 
     updateStatus(
-      `Training ${N.toLocaleString()} ratings — batch ${batch}, ${epochs} epochs${ULTRA ? ' (ULTRA)' : (FAST_MODE ? ' (FAST)' : '')}…`
+      `Training ${N.toLocaleString()} ratings — batch ${BATCH}, 1 epoch${FAST_MODE ? ' (FAST subsample)' : ''}…`
     );
 
     await model.fit([Xuser, Xmovie], Y, {
-      epochs,
-      batchSize: batch,
+      epochs: EPOCHS,
+      batchSize: BATCH,
       shuffle: true,
       validationSplit: 0,
-      callbacks: [progCb, earlyStopping(ULTRA ? 0 : 1)]
+      callbacks: [progCb]
     });
 
-    // Pre-alloc predict vars (dense indices)
+    // Prep predict vars (dense indices)
     predUserVar  = tf.variable(tf.tensor2d([[1]], [1, 1], 'int32'));
     predMovieVar = tf.variable(tf.tensor2d([[1]], [1, 1], 'int32'));
 
@@ -391,23 +366,24 @@ async function predictRating() {
 window.onload = async () => {
   try {
     updateStatus('Initializing TensorFlow.js…');
-    await ensureCpuOnly();               // lock to CPU
+    await ensureCpuOnly();               // lock to CPU (no WASM/WebGL)
 
     updateStatus('Loading MovieLens data…');
     await loadData();                    // from data.js
     populateUserDropdown();
     populateMovieDropdown();
 
-    buildDenseIdMaps();                  // needed for cache + predict
+    // Build mappings now (needed for cache + predictions)
+    buildDenseIdMaps();
 
-    // Try cached model first (instant after first train)
+    // Try cache first (instant after one successful training)
     const sig = dataSignature();
     if (await tryLoadCachedModel(sig)) {
       updateStatus('Model loaded from cache. Ready for predictions.');
       return;
     }
 
-    updateStatus(`Data loaded. Starting training on CPU${ULTRA ? ' (ULTRA)…' : '…'}`);
+    updateStatus('Data loaded. Starting 1-epoch training on CPU…');
     await trainModel();
   } catch (err) {
     console.error('Initialization error:', err);
