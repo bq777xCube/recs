@@ -15,21 +15,33 @@
 
     <main>
       <div class="controls">
-        <div class="input-group">
-          <label for="user-select">Select User:</label>
-          <select id="user-select">
-            <option value="">Loading users...</option>
-          </select>
+        <div class="row two">
+          <div class="input-group">
+            <label for="user-select">Select User</label>
+            <select id="user-select">
+              <option value="">Loading users...</option>
+            </select>
+          </div>
+
+          <div class="input-group">
+            <label for="movie-select">Select Movie</label>
+            <select id="movie-select">
+              <option value="">Loading movies...</option>
+            </select>
+          </div>
         </div>
 
-        <div class="input-group">
-          <label for="movie-select">Select Movie:</label>
-          <select id="movie-select">
-            <option value="">Loading movies...</option>
-          </select>
-        </div>
+        <div class="row two">
+          <div class="input-group toggle">
+            <input type="checkbox" id="turbo-toggle" checked />
+            <label for="turbo-toggle">Turbo mode (train faster)</label>
+            <small>Uses a sampled subset of ratings and early stopping</small>
+          </div>
 
-        <button id="predict-btn" onclick="predictRating()" disabled>Predict Rating</button>
+          <div class="input-group">
+            <button id="predict-btn" onclick="predictRating()" disabled>Predict Rating</button>
+          </div>
+        </div>
       </div>
 
       <div id="status" class="status">Loading data and training model...</div>
@@ -37,8 +49,8 @@
     </main>
   </div>
 
-  <!-- Load TensorFlow.js first, then our data module, then our main script -->
-  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@latest/dist/tf.min.js"></script>
+  <!-- TFJS + app code -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.21.0/dist/tf.min.js"></script>
   <script src="data.js"></script>
   <script src="script.js"></script>
 </body>
