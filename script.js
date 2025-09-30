@@ -1,18 +1,17 @@
-// ===== script.js (ultra-fast, GH Pages friendly) =====
-// Speed levers:
-//  • Prefer WebGL; if unavailable, auto-load WASM backend.
-//  • Mixed precision on WebGL (FP16 textures).
-//  • Big batches (WebGL 4096, WASM 1024, CPU 256) + early stopping.
-//  • Centered targets, user/movie bias, L2 regularization.
-//  • Progress bar; preallocated tensors for prediction.
+// ===== script.js (GH Pages optimized: WebGL/WASM + caching + progress bar) =====
 
 let model = null;
 let isTraining = false;
 let globalMeanRating = 3.5;
 
-// Reusable 1x1 tensors for prediction (avoid alloc on every click)
+// Reused tiny tensors for fast predict()
 let predUserVar = null;
 let predMovieVar = null;
+
+// URL flags
+const params = new URLSearchParams(location.search);
+const FAST_MODE = params.has('fast');   // ?fast=1 -> subsample to ~60k ratings for quicker train
+const NO_CACHE  = params.has('nocache'); // ?nocache=1 -> ignore cached model
 
 // ---------- UI ----------
 function updateStatus(message, isError = false) {
@@ -31,7 +30,7 @@ function updateResult(message, className = '') {
 function populateUserDropdown() {
   const sel = document.getElementById('user-select');
   sel.innerHTML = '';
-  for (const uid of userIdsSorted) {        // robust to non-contiguous IDs
+  for (const uid of userIdsSorted) { // robust to gaps
     const opt = document.createElement('option');
     opt.value = uid;
     opt.textContent = `User ${uid}`;
@@ -51,7 +50,7 @@ function populateMovieDropdown() {
   sel.disabled = false;
 }
 
-// ---------- Progress bar ----------
+// ---------- Progress bar (throttled to keep UI cheap) ----------
 function ensureProgressBar() {
   let wrap = document.getElementById('train-progress-wrap');
   if (wrap) return wrap;
@@ -90,7 +89,12 @@ function ensureProgressBar() {
   status.parentElement.insertBefore(wrap, status.nextSibling);
   return wrap;
 }
+let _lastUiUpdate = 0;
 function setProgress(pct, label) {
+  const now = performance.now();
+  if (now - _lastUiUpdate < 120) return; // throttle to ~8 fps
+  _lastUiUpdate = now;
+
   ensureProgressBar();
   const fill = document.getElementById('train-progress-fill');
   const text = document.getElementById('train-progress-text');
@@ -99,42 +103,43 @@ function setProgress(pct, label) {
   if (text) text.textContent = `${p.toFixed(1)}%${label ? ' • ' + label : ''}`;
 }
 
-// ---------- Backend selection (fastest first) ----------
+// ---------- Backend selection (WebGL → WASM) ----------
 function loadScript(src) {
   return new Promise((resolve, reject) => {
     const s = document.createElement('script');
-    s.src = src;
-    s.onload = resolve;
-    s.onerror = () => reject(new Error(`Failed to load ${src}`));
+    s.src = src; s.async = true;
+    s.onload = resolve; s.onerror = () => reject(new Error(`Failed to load ${src}`));
     document.head.appendChild(s);
   });
 }
 async function ensureBackend() {
-  // Prefer WebGL (GPU). If it fails, try WASM (SIMD where supported).
-  try {
-    await tf.setBackend('webgl');
-  } catch (_) {}
+  try { await tf.setBackend('webgl'); } catch (_) {}
   await tf.ready();
 
-  if (tf.getBackend() !== 'webgl') {
-    updateStatus('WebGL not available — loading WASM backend for speed…');
-    await loadScript('https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-wasm@latest/dist/tf-backend-wasm.js');
-    if (tf.wasm && tf.wasm.setWasmPaths) {
-      tf.wasm.setWasmPaths('https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-wasm@latest/dist/');
-    }
-    await tf.setBackend('wasm');
-    await tf.ready();
-  } else {
-    // Speed mode: use FP16 textures for higher throughput on GPU
+  if (tf.getBackend() === 'webgl') {
+    // Mixed precision for throughput
     try { tf.env().set('WEBGL_FORCE_F16_TEXTURES', true); } catch (_) {}
     try { tf.env().set('WEBGL_PACK', true); } catch (_) {}
+    updateStatus('TensorFlow.js backend: webgl (GPU)');
+    return 'webgl';
   }
 
-  updateStatus(`TensorFlow.js backend: ${tf.getBackend()}`);
+  // WASM fallback (fast on many GH Pages clients)
+  updateStatus('WebGL not available — loading WASM backend…');
+  await loadScript('https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-wasm@latest/dist/tf-backend-wasm.js');
+  if (tf.wasm && tf.wasm.setWasmPaths) {
+    tf.wasm.setWasmPaths('https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-wasm@latest/dist/');
+  }
+  const threads = Math.min(4, (navigator.hardwareConcurrency || 4));
+  try { tf.env().set('WASM_NUM_THREADS', threads); } catch (_) {}
+  await tf.setBackend('wasm');
+  await tf.ready();
+  updateStatus(`TensorFlow.js backend: wasm (${threads} threads)`);
+  return 'wasm';
 }
 
 // ---------- Model ----------
-function createModel(userDim, movieDim, latentDim = 16) { // leaner factors => faster
+function createModel(userDim, movieDim, latentDim = 16) {
   const l2 = tf.regularizers.l2({ l2: 1e-6 });
   const glorot = tf.initializers.glorotUniform({ seed: 1337 });
 
@@ -174,16 +179,57 @@ function createModel(userDim, movieDim, latentDim = 16) { // leaner factors => f
   return tf.model({ inputs: [userInput, movieInput], outputs: out });
 }
 
+// ---------- Cache helpers (skip retraining on GH Pages) ----------
+function dataSignature() {
+  // changes if dataset size or id ranges change
+  return `v3-u${maxUserId}-m${maxMovieId}-n${ratings.length}`;
+}
+async function tryLoadCachedModel(sig) {
+  if (NO_CACHE) return false;
+  try {
+    model = await tf.loadLayersModel(`indexeddb://mf-${sig}`);
+    const mean = localStorage.getItem(`mf-mean-${sig}`);
+    if (mean) globalMeanRating = parseFloat(mean);
+    updateStatus('Loaded trained model from cache.');
+    // Pre-alloc predict vars after loading
+    predUserVar  = tf.variable(tf.tensor2d([[0]], [1, 1], 'int32'));
+    predMovieVar = tf.variable(tf.tensor2d([[0]], [1, 1], 'int32'));
+    document.getElementById('predict-btn').disabled = false;
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+async function saveCachedModel(sig) {
+  try {
+    await model.save(`indexeddb://mf-${sig}`);
+    localStorage.setItem(`mf-mean-${sig}`, String(globalMeanRating));
+  } catch (e) {
+    // Ignore cache errors
+    console.warn('Cache save failed:', e);
+  }
+}
+
+// Optional quick mode: reservoir sample to ~60k ratings
+function maybeSubsample(arr, target = 60000) {
+  if (!FAST_MODE || arr.length <= target) return arr;
+  const res = new Array(Math.min(target, arr.length));
+  for (let i = 0; i < res.length; i++) res[i] = arr[i];
+  for (let i = res.length; i < arr.length; i++) {
+    const j = Math.floor(Math.random() * (i + 1));
+    if (j < res.length) res[j] = arr[i];
+  }
+  return res;
+}
+
 // ---------- Training ----------
-function earlyStopping(patience = 1) {
+function earlyStopping(pat = 1) {
   let best = Infinity, wait = 0;
-  return {
-    onEpochEnd: (_, logs) => {
-      const cur = Number.isFinite(logs.val_loss) ? logs.val_loss : logs.loss;
-      if (cur < best - 1e-4) { best = cur; wait = 0; }
-      else if (++wait >= patience) { model.stopTraining = true; }
-    }
-  };
+  return { onEpochEnd: (_, logs) => {
+    const cur = Number.isFinite(logs.val_loss) ? logs.val_loss : logs.loss;
+    if (cur < best - 1e-4) { best = cur; wait = 0; }
+    else if (++wait >= pat) { model.stopTraining = true; }
+  }};
 }
 
 async function trainModel() {
@@ -195,16 +241,23 @@ async function trainModel() {
     ensureProgressBar();
     setProgress(0, 'Preparing…');
 
+    const backend = tf.getBackend();
+    const BATCH  = backend === 'webgl' ? 4096 : backend === 'wasm' ? 1024 : 256;
+    const EPOCHS = backend === 'webgl' ? 6    : backend === 'wasm' ? 8    : 4;
+    const VAL_SPLIT = 0.0; // fastest; rely on early stopping with training loss
+
     model = createModel(maxUserId, maxMovieId, 16);
     model.compile({ optimizer: tf.train.adam(0.003), loss: 'meanSquaredError', metrics: ['mae'] });
 
-    // Build training tensors (int32 indices!)
-    const N = ratings.length;
+    // Subsample if FAST mode
+    const trainRatings = maybeSubsample(ratings);
+    const N = trainRatings.length;
+
     const uids = new Int32Array(N);
     const mids = new Int32Array(N);
     const y    = new Float32Array(N);
     for (let i = 0; i < N; i++) {
-      const r = ratings[i];
+      const r = trainRatings[i];
       uids[i] = r.userId | 0;
       mids[i] = r.movieId | 0;
       y[i] = r.rating;
@@ -215,45 +268,48 @@ async function trainModel() {
     globalMeanRating = s / N;
     for (let i = 0; i < N; i++) y[i] -= globalMeanRating;
 
-    const Xuser = tf.tensor2d(uids, [N, 1], 'int32');
+    const Xuser  = tf.tensor2d(uids, [N, 1], 'int32');
     const Xmovie = tf.tensor2d(mids, [N, 1], 'int32');
-    const Y = tf.tensor2d(y, [N, 1], 'float32');
+    const Y      = tf.tensor2d(y,    [N, 1], 'float32');
 
-    // Choose aggressive batch sizes
-    const backend = tf.getBackend();
-    const batchSize = backend === 'webgl' ? 4096 : backend === 'wasm' ? 1024 : 256;
-    const epochs = 8;             // fewer epochs; early stopping will cut earlier if converged
-    const valSplit = 0.1;
-    const trainSize = Math.floor(N * (1 - valSplit));
-    const stepsPerEpoch = Math.ceil(trainSize / batchSize);
-
+    const stepsPerEpoch = Math.ceil(N / BATCH);
     let epochIdx = 0;
+
     const progCb = {
       onTrainBegin: () => setProgress(0, 'Starting…'),
       onEpochBegin: (e) => { epochIdx = e; },
       onBatchEnd: (b) => {
-        const overall = ((epochIdx + (b + 1) / stepsPerEpoch) / epochs) * 100;
-        setProgress(overall, `Epoch ${epochIdx + 1}/${epochs}`);
+        const overall = ((epochIdx + (b + 1) / stepsPerEpoch) / EPOCHS) * 100;
+        setProgress(overall, `Epoch ${epochIdx + 1}/${EPOCHS}`);
       },
       onEpochEnd: (e, logs) => {
-        const pct = ((e + 1) / epochs) * 100;
-        setProgress(pct, `Epoch ${e + 1}/${epochs} — val_loss ${logs.val_loss?.toFixed(4)}`);
-        updateStatus(`Epoch ${e + 1}: loss ${logs.loss.toFixed(4)} • val_loss ${logs.val_loss?.toFixed(4)} • mae ${logs.mae?.toFixed(4)}`);
+        const pct = ((e + 1) / EPOCHS) * 100;
+        setProgress(pct, `Epoch ${e + 1}/${EPOCHS} — loss ${logs.loss.toFixed(4)}`);
+        updateStatus(`Epoch ${e + 1}: loss ${logs.loss.toFixed(4)} • mae ${logs.mae?.toFixed(4)}`);
       },
       onTrainEnd: () => setProgress(100, 'Finalizing…'),
     };
 
-    updateStatus(`Training ${N.toLocaleString()} ratings — batch ${batchSize}, up to ${epochs} epochs…`);
+    updateStatus(
+      `Training ${N.toLocaleString()} ratings — batch ${BATCH}, up to ${EPOCHS} epochs${FAST_MODE ? ' (FAST mode)' : ''}…`
+    );
+
     await model.fit([Xuser, Xmovie], Y, {
-      epochs, batchSize, shuffle: true, validationSplit: valSplit,
+      epochs: EPOCHS,
+      batchSize: BATCH,
+      shuffle: true,
+      validationSplit: VAL_SPLIT,
       callbacks: [progCb, earlyStopping(1)]
     });
 
-    // Prepare fast prediction path
+    // Pre-alloc predict vars
     predUserVar  = tf.variable(tf.tensor2d([[0]], [1, 1], 'int32'));
     predMovieVar = tf.variable(tf.tensor2d([[0]], [1, 1], 'int32'));
 
     tf.dispose([Xuser, Xmovie, Y]);
+
+    // Cache for next visits (instant load)
+    await saveCachedModel(dataSignature());
 
     updateStatus('Model ready. Select a user & movie, then click Predict.');
     if (btn) btn.disabled = false;
@@ -312,13 +368,22 @@ async function predictRating() {
 window.onload = async () => {
   try {
     updateStatus('Initializing TensorFlow.js…');
-    await ensureBackend(); // WebGL → WASM fallback
+    const backend = await ensureBackend(); // webgl → wasm
     updateStatus('Loading MovieLens data…');
-    await loadData();      // from data.js
+    await loadData(); // from data.js
     populateUserDropdown();
     populateMovieDropdown();
-    updateStatus('Data loaded. Starting training…');
-    await trainModel();
+
+    // Try cache first (instant start on repeat visits)
+    const sig = dataSignature();
+    const cached = await tryLoadCachedModel(sig);
+
+    if (!cached) {
+      updateStatus('Data loaded. Starting training…');
+      await trainModel();
+    } else {
+      updateStatus('Model loaded from cache. Ready for predictions.');
+    }
   } catch (err) {
     console.error('Initialization error:', err);
     updateStatus('Error initializing application: ' + err.message, true);
