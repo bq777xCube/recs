@@ -97,6 +97,36 @@ function setupGeminiKeyUI() {
 // ---------------------- Stage 2: Extract Features ----------------------
 
 /**
+ * Helper: clean Gemini text so that it becomes valid JSON.
+ * - strips ``` or ```json fences
+ * - if there is extra text, cuts from first '{' to last '}'
+ */
+function cleanLLMJson(raw) {
+  let txt = (raw || "").trim();
+
+  // Strip markdown code fences if present
+  if (txt.startsWith("```")) {
+    // remove opening ``` or ```json
+    txt = txt.replace(/^```[a-zA-Z0-9]*\s*/, "");
+    // remove trailing ```
+    const fenceIndex = txt.lastIndexOf("```");
+    if (fenceIndex !== -1) {
+      txt = txt.slice(0, fenceIndex);
+    }
+    txt = txt.trim();
+  }
+
+  // If there is extra text around, keep only the JSON object
+  const first = txt.indexOf("{");
+  const last = txt.lastIndexOf("}");
+  if (first !== -1 && last !== -1 && last > first) {
+    txt = txt.slice(first, last + 1);
+  }
+
+  return txt.trim();
+}
+
+/**
  * Calls Gemini 2.0 Flash to extract features
  * from movie description.
  *
@@ -106,17 +136,22 @@ function setupGeminiKeyUI() {
 async function extractFeaturesLLM(movie) {
   const description = movie.description || movie.title || "";
   const prompt =
-    `Extract the following features from the movie description below. ` +
-    `Return the answer as a JSON object.\n\n` +
-    `- Sub-genre: (e.g., Space Opera, Heist, Romantic Comedy)\n` +
-    `- Themes: (e.g., Good vs Evil, Coming of Age, Redemption)\n\n` +
-    `Description: ${description}`;
+    `You are a movie data processing assistant.\n` +
+    `Extract the following features from the movie description below.\n` +
+    `Return the answer as a JSON object ONLY. Do not include any markdown, backticks, comments, or extra text.\n\n` +
+    `Fields:\n` +
+    `- "sub-genre": list of sub-genres (e.g., ["Space Opera"], ["Heist"], ["Romantic Comedy"])\n` +
+    `- "themes": list of themes (e.g., ["Good vs Evil", "Coming of Age", "Redemption"])\n\n` +
+    `Description: ${description}\n\n` +
+    `Output format example (structure only):\n` +
+    `{"sub-genre": ["Space Opera"], "themes": ["Good vs Evil", "Hope"]}`;
 
   const raw = await callGeminiModel(prompt);
 
-  // be defensive: if parsing fails, fall back to known genres
   try {
-    const parsed = JSON.parse(raw);
+    const cleaned = cleanLLMJson(raw);
+    const parsed = JSON.parse(cleaned);
+
     const rawSub = parsed["sub-genre"] || parsed["sub_genre"] || [];
     const rawThemes = parsed["themes"] || [];
     return {
@@ -124,7 +159,7 @@ async function extractFeaturesLLM(movie) {
       themes: Array.isArray(rawThemes) ? rawThemes : [String(rawThemes)]
     };
   } catch (e) {
-    console.warn("Failed to parse LLM output, falling back to MovieLens genres", e);
+    console.warn("Failed to parse LLM output, falling back to MovieLens genres", e, raw);
     return {
       sub_genre: movie.genres || [],
       themes: []
