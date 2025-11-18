@@ -70,7 +70,7 @@
       <section class="pipeline-panel">
         <h2 class="section-title">3. LLM Feature Pipeline (Stages 1–4)</h2>
         <p class="section-text small">
-          For the selected movie we visualize the workflow from the slides:
+          For the selected movie we visualize the workflow:
           Read Raw Data → Extract Features (LLM) → Consolidate Keywords → Finalize & Encode.
         </p>
 
@@ -82,7 +82,7 @@
               <h3>Read Raw Data</h3>
             </div>
             <p class="stage-caption">
-              Raw text from the dataset (MovieLens title as a placeholder description).
+              Raw text from the dataset (overview + title).
             </p>
             <div class="stage-io">
               <div class="stage-label">Input (CSV row)</div>
@@ -151,6 +151,8 @@
     </footer>
   </div>
 
+  <!-- CSV parser for movies_metadata.csv -->
+  <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
   <script src="data.js"></script>
   <script src="script.js"></script>
 </body>

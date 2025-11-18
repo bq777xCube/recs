@@ -1,18 +1,26 @@
-// --- Fast lookup + pipeline state ---
+// --- Global state ---
+
 let movieById = new Map();
 
-// One-hot encoding over canonical sub-genres (Stage 3 / 4)
+// LLM features per movie: id -> { sub_genre: [...], themes: [...] }
+let llmFeaturesById = new Map();
+
+// Master keyword lists (Stage 3)
 let masterKeywords = {
-  subGenres: [], // canonical list
-  themes: []     // left empty in this MovieLens demo
+  subGenres: [],
+  themes: []
 };
 
-let genreIndex = null;   // Map sub-genre -> index in vector
-let movieVectors = [];   // Float32Array aligned with movies[]
+// indices for one-hot
+let subGenreIndex = new Map();
+let themeIndex = new Map();
 
-const USE_LLM = true;    // use Gemini for Stage 2 in the browser
+// one-hot vectors for ALL movies (for similarity)
+let movieVectors = []; // Float32Array[]
 
-// ---------------------- Initialization ----------------------
+const USE_LLM = true; // use Gemini for selected movie
+
+// ---------------------- Init ----------------------
 
 window.addEventListener("load", () => {
   initApp().catch(err => {
@@ -29,23 +37,23 @@ async function initApp() {
 
   setupGeminiKeyUI();
 
-  resultElement.textContent = "Loading MovieLens data...";
-  statusElement.textContent = "Stage 1: Reading raw CSV files (u.item, u.data)...";
+  resultElement.textContent = "Loading movies_metadata.csv...";
+  statusElement.textContent = "Stage 1: Reading raw CSV file...";
 
-  // Stage 1: Read raw data
+  // Stage 1: read data
   await loadData();
   movies.forEach(m => movieById.set(m.id, m));
 
-  // Stage 3 + 4: Build master lists & one-hot vectors
-  prepareIndexes();
+  // Stage 3 + 4 initial: мастер-лист из жанров датасета
+  rebuildMasterAndVectors();
 
-  // Populate dropdown
+  // UI
   populateMoviesDropdown();
 
   resultElement.textContent = "Pick a movie and click 'Get recommendations'.";
-  statusElement.textContent = "Ready. Pipeline: Read → Extract → Consolidate → Encode.";
+  statusElement.textContent =
+    "Ready. Pipeline: Read → Extract (LLM) → Consolidate → Encode → Recommend.";
 
-  // Button handler
   document
     .getElementById("recommend-btn")
     .addEventListener("click", async () => {
@@ -78,12 +86,14 @@ function setupGeminiKeyUI() {
 
   const stored = getGeminiKey();
   if (stored) {
-    input.value = stored.slice(0, 4) + "*****"; // masked
+    input.value = stored.slice(0, 4) + "*****";
     status.textContent = "Key is stored locally.";
   }
 
   btn.addEventListener("click", () => {
-    const raw = prompt("Paste your Gemini API key (it will be saved in this browser only):");
+    const raw = prompt(
+      "Paste your Gemini API key (it will be saved in this browser only):"
+    );
     if (!raw) {
       status.textContent = "Key not changed.";
       return;
@@ -94,21 +104,13 @@ function setupGeminiKeyUI() {
   });
 }
 
-// ---------------------- Stage 2: Extract Features ----------------------
+// ---------------------- Stage 2: LLM extraction ----------------------
 
-/**
- * Helper: clean Gemini text so that it becomes valid JSON.
- * - strips ``` or ```json fences
- * - if there is extra text, cuts from first '{' to last '}'
- */
 function cleanLLMJson(raw) {
   let txt = (raw || "").trim();
 
-  // Strip markdown code fences if present
   if (txt.startsWith("```")) {
-    // remove opening ``` or ```json
     txt = txt.replace(/^```[a-zA-Z0-9]*\s*/, "");
-    // remove trailing ```
     const fenceIndex = txt.lastIndexOf("```");
     if (fenceIndex !== -1) {
       txt = txt.slice(0, fenceIndex);
@@ -116,7 +118,6 @@ function cleanLLMJson(raw) {
     txt = txt.trim();
   }
 
-  // If there is extra text around, keep only the JSON object
   const first = txt.indexOf("{");
   const last = txt.lastIndexOf("}");
   if (first !== -1 && last !== -1 && last > first) {
@@ -126,25 +127,38 @@ function cleanLLMJson(raw) {
   return txt.trim();
 }
 
+function normalizeList(value) {
+  if (!value) return [];
+  if (Array.isArray(value)) {
+    return value.map(String).map(s => s.trim()).filter(Boolean);
+  }
+  return [String(value).trim()].filter(Boolean);
+}
+
 /**
- * Calls Gemini 2.0 Flash to extract features
- * from movie description.
- *
- * Expected JSON structure from LLM:
- * { "sub-genre": [...], "themes": [...] }
+ * Fallback: genres from dataset → used when LLM не сработал или не вызывали
+ */
+function extractFeaturesRuleBased(movie) {
+  return {
+    sub_genre: Array.isArray(movie.genres) ? movie.genres : [],
+    themes: []
+  };
+}
+
+/**
+ * One-movie LLM extract (Stage 2 for selected movie)
  */
 async function extractFeaturesLLM(movie) {
   const description = movie.description || movie.title || "";
   const prompt =
     `You are a movie data processing assistant.\n` +
     `Extract the following features from the movie description below.\n` +
-    `Return the answer as a JSON object ONLY. Do not include any markdown, backticks, comments, or extra text.\n\n` +
+    `Return the answer as a JSON object ONLY. Do not include markdown, backticks, comments, or extra text.\n\n` +
     `Fields:\n` +
     `- "sub-genre": list of sub-genres (e.g., ["Space Opera"], ["Heist"], ["Romantic Comedy"])\n` +
     `- "themes": list of themes (e.g., ["Good vs Evil", "Coming of Age", "Redemption"])\n\n` +
     `Description: ${description}\n\n` +
-    `Output format example (structure only):\n` +
-    `{"sub-genre": ["Space Opera"], "themes": ["Good vs Evil", "Hope"]}`;
+    `Output format example (structure only): {"sub-genre": ["Space Opera"], "themes": ["Good vs Evil", "Hope"]}`;
 
   const raw = await callGeminiModel(prompt);
 
@@ -155,79 +169,100 @@ async function extractFeaturesLLM(movie) {
     const rawSub = parsed["sub-genre"] || parsed["sub_genre"] || [];
     const rawThemes = parsed["themes"] || [];
     return {
-      sub_genre: Array.isArray(rawSub) ? rawSub : [String(rawSub)],
-      themes: Array.isArray(rawThemes) ? rawThemes : [String(rawThemes)]
+      sub_genre: normalizeList(rawSub),
+      themes: normalizeList(rawThemes)
     };
   } catch (e) {
-    console.warn("Failed to parse LLM output, falling back to MovieLens genres", e, raw);
-    return {
-      sub_genre: movie.genres || [],
-      themes: []
-    };
+    console.warn(
+      "Failed to parse single-movie LLM output, falling back to dataset genres",
+      e,
+      raw
+    );
+    return extractFeaturesRuleBased(movie);
   }
 }
 
 /**
- * Fallback extractor without LLM (uses MovieLens genres as sub-genres).
- */
-function extractFeaturesRuleBased(movie) {
-  return {
-    sub_genre: movie.genres || [],
-    themes: []
-  };
-}
-
-/**
- * Stage 2 main entry: choose between Gemini and fallback.
+ * Stage 2 main entry for selected movie.
+ * First try cache, then LLM, then fallback.
  */
 async function extractFeatures(movie) {
+  const cached = llmFeaturesById.get(movie.id);
+  if (cached) return cached;
+
   if (USE_LLM) {
-    try {
-      return await extractFeaturesLLM(movie);
-    } catch (e) {
-      console.warn("Gemini call failed, using fallback extractor", e);
-      return extractFeaturesRuleBased(movie);
-    }
+    const f = await extractFeaturesLLM(movie);
+    llmFeaturesById.set(movie.id, f);
+
+    // новые sub-genre/themes → пересоберём мастер-лист и вектора
+    rebuildMasterAndVectors();
+    return f;
   }
   return extractFeaturesRuleBased(movie);
 }
 
-// ---------------------- Stage 3 & 4: Master Lists + Encoding ----------------------
+/**
+ * Features used for similarity for ANY movie:
+ * если есть LLM-фичи — используем их,
+ * иначе — rule-based genres.
+ */
+function getFeaturesForSimilarity(movie) {
+  const f = llmFeaturesById.get(movie.id);
+  if (f) return f;
+  return extractFeaturesRuleBased(movie);
+}
 
-function prepareIndexes() {
-  // Stage 3: master keyword lists
-  const subGenresSet = new Set();
+// ---------------------- Stage 3 & 4: master lists + one-hot ----------------------
+
+function rebuildMasterAndVectors() {
+  const subSet = new Set();
+  const themeSet = new Set();
+
+  // Stage 3: master keywords
   for (const m of movies) {
-    (m.genres || []).forEach(g => subGenresSet.add(g));
+    const f = getFeaturesForSimilarity(m);
+    (f.sub_genre || []).forEach(s => s && subSet.add(s));
+    (f.themes || []).forEach(t => t && themeSet.add(t));
   }
 
-  masterKeywords.subGenres = Array.from(subGenresSet).sort();
-  masterKeywords.themes = []; // no themes in MovieLens 100k demo
+  masterKeywords.subGenres = Array.from(subSet).sort();
+  masterKeywords.themes = Array.from(themeSet).sort();
 
-  // Build index for subGenres
-  genreIndex = new Map();
+  subGenreIndex = new Map();
   masterKeywords.subGenres.forEach((g, idx) => {
-    genreIndex.set(g, idx);
+    subGenreIndex.set(g, idx);
   });
 
-  // Stage 4: create one-hot encoded vectors for all movies
+  themeIndex = new Map();
+  masterKeywords.themes.forEach((t, idx) => {
+    themeIndex.set(t, idx);
+  });
+
+  // Stage 4: one-hot for all movies based on current master lists
   movieVectors = movies.map(m => {
-    const features = extractFeaturesRuleBased(m); // dataset side uses genres
-    return encodeFeatures(features);
+    const f = getFeaturesForSimilarity(m);
+    return encodeFeatures(f);
   });
 }
 
 /**
- * Encode features into one-hot vector aligned with masterKeywords.subGenres.
+ * Encode sub_genre + themes into one-hot vector:
+ * [ all subGenres..., all themes... ]
  */
 function encodeFeatures(features) {
-  const dim = masterKeywords.subGenres.length;
+  const dim = masterKeywords.subGenres.length + masterKeywords.themes.length;
   const vec = new Float32Array(dim);
 
   (features.sub_genre || []).forEach(g => {
-    const idx = genreIndex.get(g);
+    const idx = subGenreIndex.get(g);
+    if (idx !== undefined) vec[idx] = 1;
+  });
+
+  (features.themes || []).forEach(t => {
+    const idx = themeIndex.get(t);
     if (idx !== undefined) {
-      vec[idx] = 1;
+      const offset = masterKeywords.subGenres.length;
+      vec[offset + idx] = 1;
     }
   });
 
@@ -253,18 +288,19 @@ function cosineSimilarity(a, b) {
   return dot / (Math.sqrt(na) * Math.sqrt(nb));
 }
 
-function getSimilarMovies(baseMovieId, topK = 10) {
-  const baseIndex = movies.findIndex(m => m.id === baseMovieId);
-  if (baseIndex === -1) return [];
-
-  const baseVec = movieVectors[baseIndex];
-
+/**
+ * baseVec — вектор выбранного фильма (из LLM фичей),
+ * остальные — уже в movieVectors.
+ */
+function getSimilarMovies(baseMovieId, baseVec, topK = 10) {
   const scores = [];
+
   for (let i = 0; i < movies.length; i++) {
-    if (i === baseIndex) continue;
+    const m = movies[i];
+    if (m.id === baseMovieId) continue;
     const sim = cosineSimilarity(baseVec, movieVectors[i]);
     if (sim <= 0) continue;
-    scores.push({ movie: movies[i], score: sim });
+    scores.push({ movie: m, score: sim });
   }
 
   scores.sort((a, b) => b.score - a.score);
@@ -284,19 +320,20 @@ async function handleRecommend(movieId) {
     return;
   }
 
-  statusElement.textContent = "Running pipeline: Extract (Gemini) → Encode → Cosine similarity...";
+  statusElement.textContent =
+    "Running pipeline: Extract (Gemini) → Consolidate → Encode → Cosine similarity...";
   resultElement.textContent = "";
 
-  // Stage 2: extract features for this specific movie (Gemini or fallback)
+  // Stage 2: LLM для выбранного фильма
   const extracted = await extractFeatures(movie);
 
-  // Stage 4: encode features (same encoder as dataset)
-  const encoded = encodeFeatures(extracted);
+  // Stage 4: вектор выбранного фильма по LLM-фичам
+  const encodedBase = encodeFeatures(extracted);
 
-  // Recommendations (content-based, cosine similarity)
-  const recs = getSimilarMovies(movieId, 10);
+  // Recommendations: similarity по LLM-вектору против всех movieVectors
+  const recs = getSimilarMovies(movieId, encodedBase, 10);
 
-  // Render recommendations
+  // Render recs
   cardsElement.innerHTML = "";
   if (recs.length === 0) {
     resultElement.textContent = "No similar movies found.";
@@ -318,8 +355,8 @@ async function handleRecommend(movieId) {
     }
   }
 
-  // Update the 4-stage visualization
-  updatePipelineView(movie, extracted, encoded);
+  // Обновляем отображение 4 стадий
+  updatePipelineView(movie, extracted, encodedBase);
 
   statusElement.textContent = "Done. You can try another movie.";
 }
@@ -327,7 +364,6 @@ async function handleRecommend(movieId) {
 function populateMoviesDropdown() {
   const selectElement = document.getElementById("movie-select");
 
-  // Clear existing options
   selectElement.innerHTML = "";
   const placeholder = document.createElement("option");
   placeholder.value = "";
@@ -382,7 +418,7 @@ Description: ${descriptionForPrompt}"`;
   const s3In = document.getElementById("stage3-input");
   const s3Out = document.getElementById("stage3-output");
 
-  s3In.textContent = "[…raw keywords from many movies…]\n(e.g., Sci-Fi, Science Fiction, Space Opera, Galactic Adventure)";
+  s3In.textContent = "[…LLM features collected for processed movies…]";
   s3Out.textContent = JSON.stringify(
     {
       master_sub_genres: masterKeywords.subGenres,
@@ -406,20 +442,15 @@ Description: ${descriptionForPrompt}"`;
   );
 
   const vectorArray = Array.from(encodedVector);
-  const preview = vectorArray.slice(0, 20);
+  const preview = vectorArray.slice(0, 24);
   s4Vec.textContent =
     "[ " +
     preview.map(v => v.toFixed(0)).join(", ") +
-    (vectorArray.length > 20 ? ", … ]" : " ]");
+    (vectorArray.length > 24 ? ", … ]" : " ]");
 }
 
-// ---------------------- Gemini Call (direct from browser) ----------------------
+// ---------------------- Gemini Call ----------------------
 
-/**
- * Frontend → Google Generative Language API (Gemini 2.0 Flash).
- * Works on GitHub Pages, but your API key is used in the browser.
- * Recommend restricting the key by domain in Google Cloud console.
- */
 async function callGeminiModel(prompt) {
   const apiKey = getGeminiKey();
   if (!apiKey) {
@@ -439,7 +470,7 @@ async function callGeminiModel(prompt) {
     ],
     generationConfig: {
       temperature: 0.2,
-      maxOutputTokens: 256
+      maxOutputTokens: 512
     }
   };
 

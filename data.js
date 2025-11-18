@@ -1,110 +1,89 @@
-// Global variables for storing movie and rating data
+// Global variables for storing movie data
 let movies = [];
-let ratings = [];
-
-// Genre names (MovieLens 100k without "unknown")
-const genreNames = [
-  "Action",
-  "Adventure",
-  "Animation",
-  "Children's",
-  "Comedy",
-  "Crime",
-  "Documentary",
-  "Drama",
-  "Fantasy",
-  "Film-Noir",
-  "Horror",
-  "Musical",
-  "Mystery",
-  "Romance",
-  "Sci-Fi",
-  "Thriller",
-  "War",
-  "Western"
-];
+let ratings = []; // not used now, kept for compatibility
 
 /**
- * Stage 1: Read Raw Data
- * Data engineering step: read CSV-like files and keep raw text.
+ * Stage 1: Read Raw Data from movies_metadata.csv
+ *
+ * We use:
+ * - id
+ * - title / original_title
+ * - overview
+ * - genres (parsed from JSON-like string)
+ * - popularity (for simple top-N filtering)
  */
 async function loadData() {
-  const [itemsResp, ratingsResp] = await Promise.all([
-    fetch("u.item"),
-    fetch("u.data")
-  ]);
-
-  if (!itemsResp.ok || !ratingsResp.ok) {
-    throw new Error("Failed to load u.item or u.data");
+  const resp = await fetch("movies_metadata.csv");
+  if (!resp.ok) {
+    throw new Error("Failed to load movies_metadata.csv");
   }
+  const text = await resp.text();
 
-  const [itemsText, ratingsText] = await Promise.all([
-    itemsResp.text(),
-    ratingsResp.text()
-  ]);
+  // PapaParse comes from CDN in index.html
+  const parsed = Papa.parse(text, {
+    header: true,
+    skipEmptyLines: true
+  });
 
-  parseItemData(itemsText);
-  parseRatingData(ratingsText);
-}
+  const tmp = [];
 
-// Parse movie data from u.item-like format
-function parseItemData(text) {
-  const lines = text.split("\n");
+  parsed.data.forEach((row, idx) => {
+    const idRaw = row.id;
+    const id = Number.isFinite(parseInt(idRaw, 10)) ? parseInt(idRaw, 10) : idx;
 
-  for (const line of lines) {
-    if (!line.trim()) continue;
+    const title =
+      row.title && row.title.trim()
+        ? row.title.trim()
+        : (row.original_title || "").trim();
 
-    const fields = line.split("|");
-    if (fields.length < 5) continue;
+    const overview = (row.overview || "").trim();
 
-    const id = parseInt(fields[0], 10);
-    const title = fields[1];
+    // Combine title + overview for LLM description
+    const description = title
+      ? `${title}. ${overview}`
+      : overview;
 
-    // Treat the original line as raw CSV input for Stage 1 visualisation
-    const rawLine = line;
-
-    // Genre bits: last N columns
-    const genreStart = fields.length - genreNames.length;
-    const bitFields = fields.slice(genreStart);
-    const bits = bitFields.map(v => parseInt(v, 10) || 0);
-
-    // Convert bits to human-readable genres
-    const genres = [];
-    bits.forEach((b, idx) => {
-      if (b === 1 && genreNames[idx]) {
-        genres.push(genreNames[idx]);
+    // genres column is like: "[{'id': 16, 'name': 'Animation'}, ...]"
+    let genres = [];
+    const genresRaw = row.genres;
+    if (genresRaw && genresRaw.trim() && genresRaw !== "[]") {
+      try {
+        // fix single quotes → double quotes
+        const fixed = genresRaw.replace(/'/g, '"');
+        const arr = JSON.parse(fixed);
+        if (Array.isArray(arr)) {
+          genres = arr
+            .map(g => g && g.name)
+            .filter(Boolean);
+        }
+      } catch (e) {
+        console.warn("Failed to parse genres for row", idRaw, e);
       }
-    });
+    }
 
-    // For MovieLens 100k there is no overview; we use title as a placeholder
-    const description = title;
+    const popularity = parseFloat(row.popularity || "0") || 0;
 
-    movies.push({
-      id,
-      title,
-      description, // used as "raw text" for LLM stages
-      rawLine,
-      genreBits: bits,
-      genres
-    });
-  }
-}
+    // compact rawLine for Stage 1 display
+    const rawLine = `id=${idRaw}, title="${title}", genres=${genres.join(
+      ", "
+    )}`;
 
-// Parse ratings data (userId, itemId, rating, timestamp)
-function parseRatingData(text) {
-  const lines = text.split("\n");
+    if ((title || overview) && description) {
+      tmp.push({
+        id,
+        title: title || `Movie ${id}`,
+        description,
+        overview,
+        rawLine,
+        genres,
+        popularity
+      });
+    }
+  });
 
-  for (const line of lines) {
-    if (!line.trim()) continue;
-
-    const fields = line.split("\t");
-    if (fields.length < 4) continue;
-
-    const userId = parseInt(fields[0], 10);
-    const itemId = parseInt(fields[1], 10);
-    const rating = parseFloat(fields[2]);
-    const timestamp = parseInt(fields[3], 10);
-
-    ratings.push({ userId, itemId, rating, timestamp });
-  }
+  // Чтобы UI не умирал от десятков тысяч фильмов — возьмём топ-N по популярности
+  tmp.sort((a, b) => b.popularity - a.popularity);
+  const MAX_MOVIES = 300; // можно увеличить/уменьшить
+  movies = tmp.slice(0, MAX_MOVIES);
+  ratings = []; // не используем
 }
