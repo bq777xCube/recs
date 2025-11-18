@@ -6,7 +6,7 @@
     name="viewport"
     content="width=device-width, initial-scale=1.0"
   />
-  <title>PenguAI — Content-Based Movie Recommender</title>
+  <title>LLM Content-Based Movie Recommender</title>
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
@@ -14,62 +14,142 @@
   <div class="bg-blur bg1"></div>
   <div class="bg-blur bg2"></div>
 
-  <header class="nav">
-    <div class="brand">
-      <div class="penguin" aria-hidden="true">
-        <div class="p-body">
-          <div class="p-belly"></div>
-          <div class="p-eye left"></div>
-          <div class="p-eye right"></div>
-          <div class="p-beak"></div>
-          <div class="p-feet"></div>
-        </div>
+  <div class="app">
+    <header class="header">
+      <div class="title-wrap">
+        <h1>LLM-Powered Movie Recommender</h1>
+        <p class="subtitle">
+          Content-Based Filtering + Gemini 2.0 Flash (4-stage pipeline)
+        </p>
       </div>
-      <span class="brand-name">PenguAI</span>
-    </div>
-    <div class="tag">content-based recommender</div>
-  </header>
+    </header>
 
-  <div class="container">
-    <h1>Content-Based Movie Recommender</h1>
-    <p>Select a movie you like, and our penguins will fetch similar ones 🐧</p>
+    <main class="layout">
+      <!-- Left: controls + results -->
+      <section class="main-panel">
+        <div class="controls-card">
+          <h2 class="section-title">1. Pick a movie</h2>
+          <p class="section-text">
+            We find similar movies via cosine similarity on one-hot features.
+          </p>
 
-    <div class="controls">
-      <label class="control">
-        <span class="label">Movie</span>
-        <select id="movie-select">
-          <option value="" disabled selected>Select a movie</option>
-        </select>
-      </label>
+          <div class="field-row">
+            <label for="movie-select">Movie</label>
+            <select id="movie-select">
+              <option value="">Loading movies...</option>
+            </select>
+          </div>
 
-      <label class="control">
-        <span class="label">Method</span>
-        <select id="algo-select">
-          <option value="jaccard" selected>Jaccard (genre overlap)</option>
-          <option value="cosine">Cosine (one-hot genres)</option>
-        </select>
-      </label>
+          <div class="field-row">
+            <label for="gemini-key-input">Gemini API key (stored only in this browser)</label>
+            <div class="key-row">
+              <input
+                id="gemini-key-input"
+                type="password"
+                placeholder="Paste your Gemini API key"
+              />
+              <button id="save-key-btn" class="small-btn">Save</button>
+            </div>
+            <p id="key-status" class="status-text small"></p>
+          </div>
 
-      <label class="control">
-        <span class="label">Top-K</span>
-        <input id="k-input" type="number" min="1" max="10" step="1" value="2" />
-      </label>
+          <button id="recommend-btn" class="primary-btn">
+            Get recommendations
+          </button>
+          <p id="status" class="status-text"></p>
+        </div>
 
-      <button id="recommend-btn" onclick="getRecommendations()">
-        <span class="btn-emoji">🐧</span>
-        Get Recommendations
-      </button>
-    </div>
+        <div id="result-box" class="results-card">
+          <h2 class="section-title">2. Recommended movies</h2>
+          <p id="result" class="section-text">Please wait, loading data...</p>
+          <ul id="cards" class="cards"></ul>
+        </div>
+      </section>
 
-    <div id="result-box">
-      <p id="result">Please wait, loading data...</p>
-      <ul id="cards" class="cards"></ul>
-    </div>
+      <!-- Right: 4-stage pipeline view -->
+      <section class="pipeline-panel">
+        <h2 class="section-title">3. LLM Feature Pipeline (Stages 1–4)</h2>
+        <p class="section-text small">
+          For the selected movie we visualize the workflow from the slides:
+          Read Raw Data → Extract Features (LLM) → Consolidate Keywords → Finalize & Encode.
+        </p>
+
+        <div class="pipeline-grid">
+          <!-- Stage 1 -->
+          <article class="stage-card">
+            <div class="stage-header">
+              <span class="stage-badge">Stage 1</span>
+              <h3>Read Raw Data</h3>
+            </div>
+            <p class="stage-caption">
+              Raw text from the dataset (MovieLens title as a placeholder description).
+            </p>
+            <div class="stage-io">
+              <div class="stage-label">Input (CSV row)</div>
+              <pre id="stage1-input" class="codebox small-code">—</pre>
+              <div class="stage-label">Output (raw text)</div>
+              <pre id="stage1-output" class="codebox">—</pre>
+            </div>
+          </article>
+
+          <!-- Stage 2 -->
+          <article class="stage-card">
+            <div class="stage-header">
+              <span class="stage-badge">Stage 2</span>
+              <h3>Extract Features (LLM)</h3>
+            </div>
+            <p class="stage-caption">
+              Gemini 2.0 Flash extracts sub-genres &amp; themes from description.
+            </p>
+            <div class="stage-io">
+              <div class="stage-label">Prompt → LLM</div>
+              <pre id="stage2-input" class="codebox small-code">—</pre>
+              <div class="stage-label">LLM JSON Output</div>
+              <pre id="stage2-output" class="codebox">—</pre>
+            </div>
+          </article>
+
+          <!-- Stage 3 -->
+          <article class="stage-card">
+            <div class="stage-header">
+              <span class="stage-badge">Stage 3</span>
+              <h3>Consolidate Keywords</h3>
+            </div>
+            <p class="stage-caption">
+              Master lists of canonical sub-genres and themes (cleaned vocabulary).
+            </p>
+            <div class="stage-io">
+              <div class="stage-label">Raw keywords (many movies)</div>
+              <pre id="stage3-input" class="codebox small-code">—</pre>
+              <div class="stage-label">Master lists</div>
+              <pre id="stage3-output" class="codebox">—</pre>
+            </div>
+          </article>
+
+          <!-- Stage 4 -->
+          <article class="stage-card">
+            <div class="stage-header">
+              <span class="stage-badge">Stage 4</span>
+              <h3>Finalize &amp; Encode</h3>
+            </div>
+            <p class="stage-caption">
+              Final feature set + one-hot encoded vectors used for cosine similarity.
+            </p>
+            <div class="stage-io">
+              <div class="stage-label">Final labels</div>
+              <pre id="stage4-output" class="codebox">—</pre>
+              <div class="stage-label">One-hot vector (excerpt)</div>
+              <pre id="stage4-vector" class="codebox small-code">—</pre>
+            </div>
+          </article>
+        </div>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <span>Static GitHub Pages demo · LLM calls run in your browser via Gemini 2.0 Flash.</span>
+    </footer>
   </div>
-
-  <footer class="footer">
-    <span>Made with ❤️ & a colony of penguins.</span>
-  </footer>
 
   <script src="data.js"></script>
   <script src="script.js"></script>

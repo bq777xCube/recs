@@ -2,87 +2,103 @@
 let movies = [];
 let ratings = [];
 
-// Genre names as defined in your setup (make sure this matches your u.item layout).
-// Note: classic MovieLens 100k has 19 genre flags (including "unknown").
-// If your u.item omits "unknown", keep this list as-is.
+// Genre names (MovieLens 100k without "unknown")
 const genreNames = [
-  "Action", "Adventure", "Animation", "Children's", "Comedy",
-  "Crime", "Documentary", "Drama", "Fantasy", "Film-Noir",
-  "Horror", "Musical", "Mystery", "Romance", "Sci-Fi",
-  "Thriller", "War", "Western"
+  "Action",
+  "Adventure",
+  "Animation",
+  "Children's",
+  "Comedy",
+  "Crime",
+  "Documentary",
+  "Drama",
+  "Fantasy",
+  "Film-Noir",
+  "Horror",
+  "Musical",
+  "Mystery",
+  "Romance",
+  "Sci-Fi",
+  "Thriller",
+  "War",
+  "Western"
 ];
 
-// Primary function to load data from files
+/**
+ * Stage 1: Read Raw Data
+ * Data engineering step: read CSV-like files and keep raw text.
+ */
 async function loadData() {
-  try {
-    // Load and parse movie data
-    const moviesResponse = await fetch('u.item');
-    if (!moviesResponse.ok) {
-      throw new Error(`Failed to load movie data: ${moviesResponse.status}`);
-    }
-    const moviesText = await moviesResponse.text();
-    parseItemData(moviesText);
+  const [itemsResp, ratingsResp] = await Promise.all([
+    fetch("u.item"),
+    fetch("u.data")
+  ]);
 
-    // Load and parse rating data
-    const ratingsResponse = await fetch('u.data');
-    if (!ratingsResponse.ok) {
-      throw new Error(`Failed to load rating data: ${ratingsResponse.status}`);
-    }
-    const ratingsText = await ratingsResponse.text();
-    parseRatingData(ratingsText);
-  } catch (error) {
-    console.error('Error loading data:', error);
-    const resultElement = document.getElementById('result');
-    if (resultElement) {
-      resultElement.textContent = `Error: ${error.message}. Please make sure u.item and u.data files are in the correct location.`;
-      resultElement.className = 'error';
-    }
-    throw error; // Re-throw to allow script.js to handle the error
+  if (!itemsResp.ok || !ratingsResp.ok) {
+    throw new Error("Failed to load u.item or u.data");
   }
+
+  const [itemsText, ratingsText] = await Promise.all([
+    itemsResp.text(),
+    ratingsResp.text()
+  ]);
+
+  parseItemData(itemsText);
+  parseRatingData(ratingsText);
 }
 
 // Parse movie data from u.item-like format
 function parseItemData(text) {
-  const lines = text.split('\n');
+  const lines = text.split("\n");
 
   for (const line of lines) {
-    if (line.trim() === '') continue;
+    if (!line.trim()) continue;
 
-    const fields = line.split('|');
-    if (fields.length < 5) continue; // Skip invalid lines
+    const fields = line.split("|");
+    if (fields.length < 5) continue;
 
     const id = parseInt(fields[0], 10);
     const title = fields[1];
 
-    // Robustly locate the genre bit-array as the LAST N columns
-    const totalFields = fields.length;
-    const N = genreNames.length; // expected number of genre flags
-    const startIdx = Math.max(0, totalFields - N);
-    const genreBitsRaw = fields.slice(startIdx, totalFields);
-    const genreBits = genreBitsRaw.map(v => {
-      const n = parseInt(v, 10);
-      return Number.isFinite(n) ? n : 0;
+    // Treat the original line as raw CSV input for Stage 1 visualisation
+    const rawLine = line;
+
+    // Genre bits: last N columns
+    const genreStart = fields.length - genreNames.length;
+    const bitFields = fields.slice(genreStart);
+    const bits = bitFields.map(v => parseInt(v, 10) || 0);
+
+    // Convert bits to human-readable genres
+    const genres = [];
+    bits.forEach((b, idx) => {
+      if (b === 1 && genreNames[idx]) {
+        genres.push(genreNames[idx]);
+      }
     });
 
-    // Build genres by matching 1-bits to genre names
-    const genres = [];
-    for (let i = 0; i < Math.min(N, genreBits.length); i++) {
-      if (genreBits[i] === 1) genres.push(genreNames[i]);
-    }
+    // For MovieLens 100k there is no overview; we use title as a placeholder
+    const description = title;
 
-    movies.push({ id, title, genres });
+    movies.push({
+      id,
+      title,
+      description, // used as "raw text" for LLM stages
+      rawLine,
+      genreBits: bits,
+      genres
+    });
   }
 }
 
-// Parse rating data from u.data format
+// Parse ratings data (userId, itemId, rating, timestamp)
 function parseRatingData(text) {
-  const lines = text.split('\n');
+  const lines = text.split("\n");
 
   for (const line of lines) {
-    if (line.trim() === '') continue;
+    if (!line.trim()) continue;
 
-    const fields = line.split('\t');
-    if (fields.length < 4) continue; // Skip invalid lines
+    const fields = line.split("\t");
+    if (fields.length < 4) continue;
 
     const userId = parseInt(fields[0], 10);
     const itemId = parseInt(fields[1], 10);
